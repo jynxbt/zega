@@ -14,7 +14,9 @@
 //!   Left-click blank           — clear focus
 //!   Left-drag title bar        — move bubble (spacer)
 //!   Type / Backspace           — edit focused fragment
-//!   Arrows                     — move caret
+//!   Ctrl/Cmd+Space             — Zig completion
+//!   Tab/Enter (popup)          — accept completion
+//!   Arrows                     — move caret (or completion)
 //!   Opt+←/→                    — word jump
 //!   Cmd+←/→ or Home/End        — line start/end
 //!   Cmd+↑/↓                    — bubble top/bottom
@@ -47,6 +49,7 @@ const edit_mod = @import("edit.zig");
 const layout = @import("layout.zig");
 const diag_mod = @import("diag.zig");
 const brackets_mod = @import("lang/brackets.zig");
+const complete_mod = @import("lang/complete.zig");
 const font_mod = @import("font.zig");
 const text_mod = @import("text.zig");
 
@@ -87,6 +90,11 @@ const bubble_drag_threshold_px: f32 = 6.0;
 const focus_preferred_zoom: f32 = 1.45;
 const focus_min_zoom: f32 = 0.35;
 const focus_max_zoom: f32 = 2.5;
+/// Absolute scroll zoom floor/ceiling when nothing is focused.
+const canvas_min_zoom: f32 = 0.15;
+const canvas_max_zoom: f32 = 4.0;
+/// When focused, bubble width may fill at most this fraction of the viewport.
+const focused_bubble_max_width_frac: f32 = 0.92;
 /// World units per second for WASD pan when nothing is focused.
 const wasd_pan_speed: f32 = 720.0;
 
@@ -133,6 +141,24 @@ const state = struct {
     var key_a: bool = false;
     var key_s: bool = false;
     var key_d: bool = false;
+
+    /// Delete-bubble confirmation modal.
+    var confirm_open: bool = false;
+    var confirm_bubble: BubbleId = bubble_mod.INVALID_BUBBLE;
+    var confirm_hover_btn: i32 = -1;
+
+    /// Zig completion popup (local completer).
+    var completion_open: bool = false;
+    var completion_selected: i32 = 0;
+    var completion_hover: i32 = -1;
+    var completion_x: f32 = 0;
+    var completion_y: f32 = 0;
+    var completion_prefix_len: u32 = 0;
+    var completion_items: std.ArrayListUnmanaged(complete_mod.Candidate) = .empty;
+    /// Owned label copies for stable popup lifetime (symbols point into docs otherwise).
+    var completion_labels: std.ArrayListUnmanaged([]u8) = .empty;
+    var completion_kind_tags: [complete_mod.max_results][]const u8 = .{""} ** complete_mod.max_results;
+    var completion_label_views: [complete_mod.max_results][]const u8 = .{""} ** complete_mod.max_results;
 
     var cli_paths: []const []const u8 = &.{};
 };
@@ -301,7 +327,221 @@ fn clearFocus() void {
         b.selection.clear();
     }
     state.focused = bubble_mod.INVALID_BUBBLE;
+    closeCompletion();
     cancelFocusCamera();
+}
+
+fn closeCompletion() void {
+    state.completion_open = false;
+    state.completion_selected = 0;
+    state.completion_hover = -1;
+    state.completion_prefix_len = 0;
+    state.completion_items.clearRetainingCapacity();
+    freeCompletionLabels();
+}
+
+fn confirmModalView() render_mod.ConfirmModalView {
+    return .{
+        .open = state.confirm_open,
+        .hover_btn = state.confirm_hover_btn,
+        .message = "Are you sure about deleting this bubble?",
+    };
+}
+
+fn openDeleteConfirm(id: BubbleId) void {
+    closeCompletion();
+    closeContextMenu();
+    state.confirm_open = true;
+    state.confirm_bubble = id;
+    state.confirm_hover_btn = -1;
+    state.drag = .none;
+}
+
+fn closeDeleteConfirm() void {
+    state.confirm_open = false;
+    state.confirm_bubble = bubble_mod.INVALID_BUBBLE;
+    state.confirm_hover_btn = -1;
+}
+
+fn confirmDeleteBubble() void {
+    const id = state.confirm_bubble;
+    closeDeleteConfirm();
+    if (id == bubble_mod.INVALID_BUBBLE) return;
+    if (state.focused == id) clearFocus();
+    if (state.hovered == id) state.hovered = bubble_mod.INVALID_BUBBLE;
+    if (state.hover_anim_id == id) {
+        state.hover_anim_id = bubble_mod.INVALID_BUBBLE;
+        state.hover_amount = 0;
+    }
+    if (state.drag_bubble == id) {
+        state.drag = .none;
+        state.drag_bubble = bubble_mod.INVALID_BUBBLE;
+    }
+    state.canvas.removeBubble(id);
+    // Working-set halos may change after membership drop.
+    spacer.recomputeWorkingSets(&state.canvas) catch {};
+}
+
+fn freeCompletionLabels() void {
+    const a = state.gpa.allocator();
+    for (state.completion_labels.items) |s| a.free(s);
+    state.completion_labels.clearRetainingCapacity();
+}
+
+fn completionPopupView() render_mod.CompletionPopupView {
+    const n = @min(state.completion_items.items.len, complete_mod.max_results);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        state.completion_label_views[i] = state.completion_labels.items[i];
+        state.completion_kind_tags[i] = complete_mod.kindTag(state.completion_items.items[i].kind);
+    }
+    return .{
+        .open = state.completion_open,
+        .x = state.completion_x,
+        .y = state.completion_y,
+        .selected = state.completion_selected,
+        .hover_item = state.completion_hover,
+        .count = @intCast(n),
+        .labels = state.completion_label_views[0..n],
+        .kinds = state.completion_kind_tags[0..n],
+    };
+}
+
+/// Rebuild completion list for the focused Zig bubble at the caret.
+fn refreshCompletion(force_open: bool) void {
+    if (state.focused == bubble_mod.INVALID_BUBBLE) {
+        closeCompletion();
+        return;
+    }
+    const b = state.canvas.findBubble(state.focused) orelse {
+        closeCompletion();
+        return;
+    };
+    const f = b.fragment() orelse {
+        closeCompletion();
+        return;
+    };
+    const doc = state.store.getConst(f.doc) orelse {
+        closeCompletion();
+        return;
+    };
+    if (doc.lang != .zig) {
+        closeCompletion();
+        return;
+    }
+
+    const source_body = b.displayText(&state.store);
+    const line_bytes = bubble_mod.lineSliceOf(source_body, b.caret.line);
+    const pre = complete_mod.prefixAt(line_bytes, b.caret.col);
+
+    // Auto-close when no prefix and not forced / not after dot.
+    if (!force_open and pre.prefix.len == 0 and !pre.after_dot and !state.completion_open) {
+        closeCompletion();
+        return;
+    }
+    if (!force_open and pre.prefix.len == 0 and !pre.after_dot and state.completion_open) {
+        // Keep open only if we forced empty list? Close when prefix empty unless after_dot.
+        closeCompletion();
+        return;
+    }
+
+    // Collect open-doc sources for working-set symbols.
+    var sources: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer sources.deinit(state.gpa.allocator());
+    sources.append(state.gpa.allocator(), source_body) catch {};
+    for (state.store.docs.items) |*d| {
+        if (d.id == f.doc) {
+            // Prefer full document for neighbors when not fully covered by local body.
+            if (b.local_text == null) {
+                // already have display body == full frag or range
+            } else {
+                sources.append(state.gpa.allocator(), d.bytes.items) catch {};
+            }
+        } else {
+            sources.append(state.gpa.allocator(), d.bytes.items) catch {};
+        }
+    }
+
+    var raw: std.ArrayListUnmanaged(complete_mod.Candidate) = .empty;
+    defer raw.deinit(state.gpa.allocator());
+    complete_mod.suggest(state.gpa.allocator(), .{
+        .prefix = pre.prefix,
+        .after_dot = pre.after_dot,
+        .sources = sources.items,
+    }, &raw) catch {
+        closeCompletion();
+        return;
+    };
+
+    freeCompletionLabels();
+    state.completion_items.clearRetainingCapacity();
+    const a = state.gpa.allocator();
+    for (raw.items) |c| {
+        const dup = a.dupe(u8, c.label) catch continue;
+        state.completion_labels.append(a, dup) catch {
+            a.free(dup);
+            continue;
+        };
+        state.completion_items.append(a, .{
+            .label = state.completion_labels.items[state.completion_labels.items.len - 1],
+            .kind = c.kind,
+            .score = c.score,
+        }) catch {};
+    }
+
+    if (state.completion_items.items.len == 0) {
+        closeCompletion();
+        return;
+    }
+
+    state.completion_prefix_len = @intCast(pre.prefix.len);
+    state.completion_selected = 0;
+    state.completion_hover = -1;
+    state.completion_open = true;
+
+    // Anchor under caret in screen space.
+    const anchor = bubbleCaretAnchor(b);
+    const sc = state.canvas.viewport.worldToScreen(anchor);
+    const scale = @max(state.canvas.viewport.dpi, 1.0);
+    state.completion_x = sc.x;
+    state.completion_y = sc.y + font_mod.Font.charH() * scale + 2;
+}
+
+fn acceptCompletion() void {
+    if (!state.completion_open) return;
+    if (state.focused == bubble_mod.INVALID_BUBBLE) {
+        closeCompletion();
+        return;
+    }
+    const n = state.completion_items.items.len;
+    if (n == 0) {
+        closeCompletion();
+        return;
+    }
+    var sel = state.completion_selected;
+    if (sel < 0) sel = 0;
+    if (sel >= @as(i32, @intCast(n))) sel = @intCast(n - 1);
+    const label = state.completion_items.items[@intCast(sel)].label;
+    const prefix_len = state.completion_prefix_len;
+    // Copy label before close frees storage.
+    const a = state.gpa.allocator();
+    const insert = a.dupe(u8, label) catch {
+        closeCompletion();
+        return;
+    };
+    defer a.free(insert);
+
+    closeCompletion();
+    state.editor.replacePrefix(
+        &state.store,
+        &state.canvas,
+        state.focused,
+        prefix_len,
+        insert,
+    ) catch {};
+    if (state.canvas.findBubble(state.focused)) |b| edit_mod.Editor.clampCaret(&state.store, b);
+    refreshFocusedDiags();
+    afterCaretMoved();
 }
 
 fn focusBubbleOpts(id: BubbleId, fly_camera: bool) void {
@@ -458,13 +698,15 @@ fn startFocusCameraOnBubble(b: *const bubble_mod.Bubble, anchor_opt: ?geom.Vec2,
     const anchor = anchor_opt orelse bubbleReadingAnchor(b);
     // Light pad so the border/title aren't flush with the window edge.
     const padded = b.bounds.expanded(12);
+    // Focus fly-to also respects size-based max zoom-in.
+    const size_max = maxZoomForFocusedBubble();
     const target = vp.focusTarget(
         padded,
         anchor,
         0.10,
         focus_preferred_zoom,
         focus_min_zoom,
-        focus_max_zoom,
+        @min(focus_max_zoom, size_max),
     );
 
     if (instant) {
@@ -746,6 +988,27 @@ export fn frame() void {
         else
             -1;
     }
+    if (state.completion_open) {
+        state.completion_hover = if (render_mod.completionHit(
+            completionPopupView(),
+            state.mouse.x,
+            state.mouse.y,
+            state.canvas.viewport.dpi,
+        )) |idx|
+            @intCast(idx)
+        else
+            -1;
+    }
+    if (state.confirm_open) {
+        state.confirm_hover_btn = render_mod.confirmModalHit(
+            confirmModalView(),
+            state.mouse.x,
+            state.mouse.y,
+            state.canvas.viewport.screen_w,
+            state.canvas.viewport.screen_h,
+            state.canvas.viewport.dpi,
+        ) orelse -1;
+    }
 
     state.renderer.draw(
         &state.canvas,
@@ -758,6 +1021,8 @@ export fn frame() void {
         state.hover_amount,
         currentLinkHighlight(),
         state.ctx_menu,
+        completionPopupView(),
+        confirmModalView(),
     );
 
     sg.beginPass(.{
@@ -822,6 +1087,31 @@ fn handleMouseDown(e: *const sapp.Event) void {
             // Don't pan yet — short right-click opens the menu on blank space.
         },
         .LEFT => {
+            // Delete confirmation modal first.
+            if (state.confirm_open) {
+                if (render_mod.confirmModalHit(
+                    confirmModalView(),
+                    state.mouse.x,
+                    state.mouse.y,
+                    state.canvas.viewport.screen_w,
+                    state.canvas.viewport.screen_h,
+                    state.canvas.viewport.dpi,
+                )) |btn| {
+                    if (btn == 0) confirmDeleteBubble() else closeDeleteConfirm();
+                } else if (!render_mod.confirmModalPanelHit(
+                    confirmModalView(),
+                    state.mouse.x,
+                    state.mouse.y,
+                    state.canvas.viewport.screen_w,
+                    state.canvas.viewport.screen_h,
+                    state.canvas.viewport.dpi,
+                )) {
+                    // Click scrim → cancel.
+                    closeDeleteConfirm();
+                }
+                return;
+            }
+
             // Context menu click handling.
             if (state.ctx_menu.open) {
                 if (render_mod.contextMenuHit(
@@ -843,6 +1133,16 @@ fn handleMouseDown(e: *const sapp.Event) void {
             }
             const world = state.canvas.viewport.screenToWorld(state.mouse);
             if (state.canvas.hitTest(world)) |id| {
+                // Close button on title bar → confirm delete (do not start drag).
+                // The × only renders on the focused bubble, so only honor hits there.
+                if (state.focused == id) {
+                    if (state.canvas.findBubble(id)) |b| {
+                        if (b.hitCloseButton(world)) {
+                            openDeleteConfirm(id);
+                            return;
+                        }
+                    }
+                }
                 // Click body or title → focus. Drag only from the title bar.
                 if (state.canvas.hitTestTitleBar(world) == id) {
                     // Title bar: capture grab under cursor *before* any camera fly-to,
@@ -1033,13 +1333,39 @@ fn handleScroll(e: *const sapp.Event) void {
     }
 }
 
+/// Max zoom-in while a bubble is focused, based on that bubble's size.
+/// Larger bubbles get a lower ceiling so they don't blow past the screen;
+/// small bubbles can still zoom in more (up to `canvas_max_zoom`).
+fn maxZoomForFocusedBubble() f32 {
+    if (state.focused == bubble_mod.INVALID_BUBBLE) return canvas_max_zoom;
+    const b = state.canvas.findBubble(state.focused) orelse return canvas_max_zoom;
+    syncViewportSize();
+    const vp = state.canvas.viewport;
+    const dpi = @max(vp.dpi, 1.0);
+    const bw = @max(b.bounds.w, 32.0);
+    const bh = @max(b.bounds.h, 24.0);
+    // Width: bubble should not exceed `focused_bubble_max_width_frac` of the screen.
+    const z_w = (vp.screen_w * focused_bubble_max_width_frac) / (bw * dpi);
+    // Height: for short bubbles, also cap so the whole bubble isn't > ~95% of view height
+    // when fully visible (tall bubbles already pan; only clamp huge short+wide ones).
+    const z_h = (vp.screen_h * 0.95) / (bh * dpi);
+    // Use the tighter of width/height caps for short bubbles; for tall ones width dominates
+    // (height fit would force an unusably small max zoom).
+    const tall = bh * focus_preferred_zoom * dpi > vp.screen_h * 0.92;
+    const size_cap = if (tall) z_w else @min(z_w, z_h);
+    // Never below preferred reading zoom (allow at least that), never above canvas max.
+    return std.math.clamp(size_cap, focus_preferred_zoom, canvas_max_zoom);
+}
+
 fn zoomByScroll(ticks: f32) void {
     if (ticks == 0) return;
     const factor: f32 = if (ticks > 0) 1.1 else 1.0 / 1.1;
+    const min_z = canvas_min_zoom;
+    const max_z = maxZoomForFocusedBubble();
     const n: i32 = @intFromFloat(@min(5.0, @abs(ticks)));
     var i: i32 = 0;
     while (i < @max(1, n)) : (i += 1) {
-        state.canvas.viewport.zoomAt(state.mouse, factor, 0.15, 4.0);
+        state.canvas.viewport.zoomAt(state.mouse, factor, min_z, max_z);
     }
 }
 
@@ -1150,11 +1476,51 @@ fn updateWasdPan() void {
 
 fn handleKeyDown(e: *const sapp.Event) void {
     if (e.key_code == .ESCAPE) {
+        if (state.confirm_open) {
+            closeDeleteConfirm();
+            return;
+        }
+        if (state.completion_open) {
+            closeCompletion();
+            return;
+        }
         if (state.ctx_menu.open) {
             closeContextMenu();
             return;
         }
         sapp.requestQuit();
+        return;
+    }
+
+    // Enter on delete modal confirms; no other typing while open.
+    if (state.confirm_open) {
+        if (e.key_code == .ENTER) {
+            confirmDeleteBubble();
+            return;
+        }
+        return;
+    }
+
+    // Completion navigation / accept (before edit keys).
+    if (state.completion_open and state.focused != bubble_mod.INVALID_BUBBLE) {
+        if (e.key_code == .UP) {
+            if (state.completion_selected > 0) state.completion_selected -= 1;
+            return;
+        }
+        if (e.key_code == .DOWN) {
+            const max_i: i32 = @intCast(@max(state.completion_items.items.len, 1) - 1);
+            if (state.completion_selected < max_i) state.completion_selected += 1;
+            return;
+        }
+        if (e.key_code == .TAB or e.key_code == .ENTER) {
+            acceptCompletion();
+            return;
+        }
+    }
+
+    // Ctrl/Cmd+Space → force completion.
+    if (isMod(e) and !isShift(e) and e.key_code == .SPACE) {
+        refreshCompletion(true);
         return;
     }
 
@@ -1355,6 +1721,11 @@ fn handleKeyDown(e: *const sapp.Event) void {
     if (state.canvas.findBubble(id)) |b| edit_mod.Editor.clampCaret(&state.store, b);
     if (edited) refreshFocusedDiags();
     if (moved or edited) afterCaretMoved();
+    if (edited) {
+        if (state.completion_open) refreshCompletion(false) else closeCompletion();
+    } else if (moved) {
+        closeCompletion();
+    }
 }
 
 fn handleChar(e: *const sapp.Event) void {
@@ -1381,6 +1752,15 @@ fn handleChar(e: *const sapp.Event) void {
     if (state.canvas.findBubble(state.focused)) |b| edit_mod.Editor.clampCaret(&state.store, b);
     refreshFocusedDiags();
     afterCaretMoved();
+
+    // Auto-trigger completion for identifier chars and '.'.
+    const is_id = (cp >= 'A' and cp <= 'Z') or (cp >= 'a' and cp <= 'z') or
+        (cp >= '0' and cp <= '9') or cp == '_' or cp == '@' or cp == '.';
+    if (is_id or state.completion_open) {
+        refreshCompletion(cp == '.' or cp == '@');
+    } else {
+        closeCompletion();
+    }
 }
 
 export fn cleanup() void {
@@ -1396,6 +1776,9 @@ export fn cleanup() void {
             std.log.warn("quit: {d} bubble(s) still unsaved (use Cmd+S per bubble)", .{unsaved});
         }
 
+        closeCompletion();
+        state.completion_items.deinit(state.gpa.allocator());
+        state.completion_labels.deinit(state.gpa.allocator());
         state.editor.deinit();
         state.canvas.deinit();
         state.brackets.deinit();
@@ -1438,7 +1821,7 @@ pub fn main(init_ctx: std.process.Init) void {
         .high_dpi = true,
         // MSAA softens thin glyph edges; keep off for crisp code text.
         .sample_count = 1,
-        .window_title = "zega — Code Bubbles (Zig/Rust)",
+        .window_title = "ZEGA",
         .icon = .{ .sokol_default = true },
         .logger = .{ .func = slog.func },
         .win32 = .{ .console_attach = true },

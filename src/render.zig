@@ -182,6 +182,8 @@ pub const Renderer = struct {
         hover_amount: f32,
         link_hl: ?LinkHighlight,
         menu: ?ContextMenuView,
+        completion: ?CompletionPopupView,
+        confirm: ?ConfirmModalView,
     ) void {
         const vp = canvas.viewport;
         const w = vp.screen_w;
@@ -203,6 +205,12 @@ pub const Renderer = struct {
         if (menu) |m| {
             if (m.open) drawContextMenu(self, vp, m);
         }
+        if (completion) |cp| {
+            if (cp.open and cp.count > 0) drawCompletionPopup(self, vp, cp);
+        }
+        if (confirm) |cm| {
+            if (cm.open) drawConfirmModal(self, vp, cm);
+        }
     }
 
     pub fn passAction(self: *const Renderer) sg.PassAction {
@@ -220,9 +228,43 @@ pub const ContextMenuView = struct {
     hover_item: i32 = -1,
 };
 
+/// Screen-space completion list (near caret).
+pub const CompletionPopupView = struct {
+    open: bool = false,
+    x: f32 = 0,
+    y: f32 = 0,
+    /// Selected row (keyboard).
+    selected: i32 = 0,
+    /// Hovered row, or -1.
+    hover_item: i32 = -1,
+    /// Number of valid rows in labels/kinds.
+    count: u32 = 0,
+    /// Row labels (not owned by renderer).
+    labels: []const []const u8 = &.{},
+    /// Kind tags: "kw" / "bi" / "sym" (not owned).
+    kinds: []const []const u8 = &.{},
+};
+
 pub const context_menu_item_h: f32 = 28;
 pub const context_menu_w: f32 = 180;
 pub const context_menu_pad: f32 = 6;
+pub const completion_item_h: f32 = 24;
+pub const completion_w: f32 = 240;
+pub const completion_pad: f32 = 4;
+pub const completion_max_visible: u32 = 12;
+
+/// Centered modal: message + Delete / Cancel.
+pub const ConfirmModalView = struct {
+    open: bool = false,
+    /// Which button is hovered: -1 none, 0 Delete, 1 Cancel.
+    hover_btn: i32 = -1,
+    message: []const u8 = "Are you sure about deleting this bubble?",
+};
+
+pub const confirm_modal_w: f32 = 360;
+pub const confirm_modal_h: f32 = 140;
+pub const confirm_btn_w: f32 = 100;
+pub const confirm_btn_h: f32 = 32;
 /// Labels for menu rows (extend as needed).
 pub const context_menu_labels = [_][]const u8{
     "Create new file",
@@ -260,6 +302,13 @@ const menu_bg = Color.rgb(0.16, 0.17, 0.20);
 const menu_border = Color.rgb(0.40, 0.42, 0.48);
 const menu_hover = Color.rgb(0.28, 0.32, 0.42);
 const menu_text = Color.rgb(0.90, 0.91, 0.93);
+const modal_scrim = Color.rgba(0.0, 0.0, 0.0, 0.45);
+const modal_btn_delete = Color.rgb(0.72, 0.28, 0.28);
+const modal_btn_delete_hover = Color.rgb(0.85, 0.35, 0.35);
+const modal_btn_cancel = Color.rgb(0.28, 0.30, 0.36);
+const modal_btn_cancel_hover = Color.rgb(0.38, 0.40, 0.48);
+const close_btn_fg = Color.rgb(0.85, 0.55, 0.55);
+const close_btn_fg_hot = Color.rgb(1.0, 0.45, 0.45);
 
 const conn_color = Color.rgba(0.45, 0.72, 0.88, 0.85);
 const conn_color_active = Color.rgba(0.55, 0.85, 1.0, 0.95);
@@ -312,6 +361,198 @@ fn drawContextMenu(r: *Renderer, vp: Viewport, menu: ContextMenuView) void {
     }
 }
 
+fn drawCloseButton(vp: Viewport, box: BoundingBox, hot: bool) void {
+    const col = if (hot) close_btn_fg_hot else close_btn_fg;
+    const tl = vp.worldToScreen(.{ .x = box.x, .y = box.y });
+    const br = vp.worldToScreen(.{ .x = box.right(), .y = box.bottom() });
+    const pad = @max(2.0, (br.x - tl.x) * 0.28);
+    const x0 = tl.x + pad;
+    const y0 = tl.y + pad;
+    const x1 = br.x - pad;
+    const y1 = br.y - pad;
+    // Two diagonal strokes as thin quads.
+    const t: f32 = @max(1.2, (br.x - tl.x) * 0.12);
+    strokeScreenSeg(x0, y0, x1, y1, t, col);
+    strokeScreenSeg(x1, y0, x0, y1, t, col);
+}
+
+fn strokeScreenSeg(ax: f32, ay: f32, bx: f32, by: f32, thick: f32, c: Color) void {
+    var dx = bx - ax;
+    var dy = by - ay;
+    const len = @sqrt(dx * dx + dy * dy);
+    if (len < 0.5) return;
+    dx /= len;
+    dy /= len;
+    const half = thick * 0.5;
+    const px = -dy * half;
+    const py = dx * half;
+    sgl.beginQuads();
+    sgl.v2fC4f(ax + px, ay + py, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(ax - px, ay - py, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(bx - px, by - py, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(bx + px, by + py, c.r, c.g, c.b, c.a);
+    sgl.end();
+}
+
+/// Resolved screen-space geometry for the confirm modal. Computed in one place
+/// so drawing and hit-testing always agree, and the panel sizes to its content.
+const ConfirmModalLayout = struct {
+    mx: f32,
+    my: f32,
+    mw: f32,
+    mh: f32,
+    delete_x: f32,
+    cancel_x: f32,
+    by0: f32,
+    bw: f32,
+    bh: f32,
+    gap: f32,
+    msg_x: f32,
+    msg_y: f32,
+};
+
+/// Side padding between the panel edge and its content.
+const confirm_modal_pad: f32 = 16;
+
+fn confirmModalLayout(modal: ConfirmModalView, screen_w: f32, screen_h: f32, dpi: f32) ConfirmModalLayout {
+    const scale = @max(dpi, 1.0);
+    const pad = confirm_modal_pad * scale;
+    const bw = confirm_btn_w * scale;
+    const bh = confirm_btn_h * scale;
+    const gap = 16 * scale;
+
+    // Fit the wider of the message and the button row, then add side padding.
+    const msg_w = @as(f32, @floatFromInt(modal.message.len)) * Font.charW() * scale;
+    const btn_row_w = bw * 2 + gap;
+    const content_w = @max(msg_w, btn_row_w);
+    const mw = @max(confirm_modal_w * scale, content_w + pad * 2);
+    const mh = confirm_modal_h * scale;
+
+    const mx = (screen_w - mw) * 0.5;
+    const my = (screen_h - mh) * 0.5;
+
+    const by0 = my + mh - bh - 20 * scale;
+    return .{
+        .mx = mx,
+        .my = my,
+        .mw = mw,
+        .mh = mh,
+        .delete_x = mx + mw * 0.5 - bw - gap * 0.5,
+        .cancel_x = mx + mw * 0.5 + gap * 0.5,
+        .by0 = by0,
+        .bw = bw,
+        .bh = bh,
+        .gap = gap,
+        .msg_x = mx + pad,
+        .msg_y = my + 28 * scale,
+    };
+}
+
+fn drawConfirmModal(r: *Renderer, vp: Viewport, modal: ConfirmModalView) void {
+    const scale = @max(vp.dpi, 1.0);
+    // Dim the canvas.
+    fillScreenRect(0, 0, vp.screen_w, vp.screen_h, modal_scrim);
+
+    const lyt = confirmModalLayout(modal, vp.screen_w, vp.screen_h, vp.dpi);
+
+    fillScreenRect(lyt.mx, lyt.my, lyt.mx + lyt.mw, lyt.my + lyt.mh, menu_bg);
+    strokeScreenRect(lyt.mx, lyt.my, lyt.mx + lyt.mw, lyt.my + lyt.mh, menu_border, @max(1.0, scale));
+
+    // Message (single line; panel width is sized to fit it). Fixed scale so the
+    // modal never grows with canvas zoom (it appears after a focus zoom-in).
+    drawTextScreenFixed(r, modal.message, lyt.msg_x, lyt.msg_y, scale, menu_text);
+
+    // Buttons: Delete (left), Cancel (right).
+    const del_bg = if (modal.hover_btn == 0) modal_btn_delete_hover else modal_btn_delete;
+    const can_bg = if (modal.hover_btn == 1) modal_btn_cancel_hover else modal_btn_cancel;
+    fillScreenRect(lyt.delete_x, lyt.by0, lyt.delete_x + lyt.bw, lyt.by0 + lyt.bh, del_bg);
+    fillScreenRect(lyt.cancel_x, lyt.by0, lyt.cancel_x + lyt.bw, lyt.by0 + lyt.bh, can_bg);
+
+    const ty = lyt.by0 + (lyt.bh - Font.charH() * scale) * 0.5;
+    // Center labels roughly inside buttons.
+    const del_label = "Delete";
+    const can_label = "Cancel";
+    const del_tx = lyt.delete_x + (lyt.bw - @as(f32, @floatFromInt(del_label.len)) * Font.charW() * scale) * 0.5;
+    const can_tx = lyt.cancel_x + (lyt.bw - @as(f32, @floatFromInt(can_label.len)) * Font.charW() * scale) * 0.5;
+    drawTextScreenFixed(r, del_label, del_tx, ty, scale, menu_text);
+    drawTextScreenFixed(r, can_label, can_tx, ty, scale, menu_text);
+}
+
+/// Hit-test confirm modal buttons. Returns 0=Delete, 1=Cancel, null=elsewhere (including scrim).
+pub fn confirmModalHit(modal: ConfirmModalView, sx: f32, sy: f32, screen_w: f32, screen_h: f32, dpi: f32) ?i32 {
+    if (!modal.open) return null;
+    const lyt = confirmModalLayout(modal, screen_w, screen_h, dpi);
+    if (sx >= lyt.delete_x and sx < lyt.delete_x + lyt.bw and sy >= lyt.by0 and sy < lyt.by0 + lyt.bh) return 0;
+    if (sx >= lyt.cancel_x and sx < lyt.cancel_x + lyt.bw and sy >= lyt.by0 and sy < lyt.by0 + lyt.bh) return 1;
+    return null;
+}
+
+/// True if point is inside the modal panel (not scrim).
+pub fn confirmModalPanelHit(modal: ConfirmModalView, sx: f32, sy: f32, screen_w: f32, screen_h: f32, dpi: f32) bool {
+    if (!modal.open) return false;
+    const lyt = confirmModalLayout(modal, screen_w, screen_h, dpi);
+    return sx >= lyt.mx and sx < lyt.mx + lyt.mw and sy >= lyt.my and sy < lyt.my + lyt.mh;
+}
+
+fn drawCompletionPopup(r: *Renderer, vp: Viewport, popup: CompletionPopupView) void {
+    const scale = @max(vp.dpi, 1.0);
+    const mw = completion_w * scale;
+    const ih = completion_item_h * scale;
+    const pad = completion_pad * scale;
+    const n = @min(popup.count, completion_max_visible);
+    if (n == 0) return;
+    const mh = pad * 2 + ih * @as(f32, @floatFromInt(n));
+
+    var mx = popup.x;
+    var my = popup.y;
+    if (mx + mw > vp.screen_w) mx = @max(0, vp.screen_w - mw);
+    if (my + mh > vp.screen_h) my = @max(0, popup.y - mh - Font.charH() * scale); // above caret
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+
+    fillScreenRect(mx, my, mx + mw, my + mh, menu_bg);
+    const bt = @max(1.0, scale);
+    strokeScreenRect(mx, my, mx + mw, my + mh, menu_border, bt);
+
+    const kind_col = Color.rgb(0.55, 0.70, 0.85);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const iy0 = my + pad + @as(f32, @floatFromInt(i)) * ih;
+        const iy1 = iy0 + ih;
+        const selected = popup.selected == @as(i32, @intCast(i));
+        const hovered = popup.hover_item == @as(i32, @intCast(i));
+        if (selected or hovered) {
+            fillScreenRect(mx + 2 * scale, iy0, mx + mw - 2 * scale, iy1, menu_hover);
+        }
+        const label = if (i < popup.labels.len) popup.labels[i] else "";
+        const kind = if (i < popup.kinds.len) popup.kinds[i] else "";
+        const ty = iy0 + (ih - Font.charH() * scale) * 0.5;
+        drawTextScreen(r, vp, label, mx + pad + 4 * scale, ty, menu_text);
+        // Kind tag right-aligned-ish
+        const kind_x = mx + mw - pad - 4 * scale - @as(f32, @floatFromInt(kind.len)) * Font.charW() * scale;
+        drawTextScreen(r, vp, kind, kind_x, ty, kind_col);
+    }
+}
+
+/// Hit-test completion row under screen point.
+pub fn completionHit(popup: CompletionPopupView, sx: f32, sy: f32, dpi: f32) ?usize {
+    if (!popup.open or popup.count == 0) return null;
+    const scale = @max(dpi, 1.0);
+    const mw = completion_w * scale;
+    const ih = completion_item_h * scale;
+    const pad = completion_pad * scale;
+    const n = @min(popup.count, completion_max_visible);
+    const mx = popup.x;
+    const my = popup.y;
+    if (sx < mx or sy < my) return null;
+    if (sx >= mx + mw) return null;
+    const rel_y = sy - my - pad;
+    if (rel_y < 0) return null;
+    const idx: i32 = @intFromFloat(@floor(rel_y / ih));
+    if (idx < 0 or idx >= @as(i32, @intCast(n))) return null;
+    return @intCast(idx);
+}
+
 /// Draw text starting at screen-pixel position (for UI chrome).
 fn drawTextScreen(r: *Renderer, vp: Viewport, bytes: []const u8, sx: f32, sy: f32, color: Color) void {
     // Inverse of worldToScreen at pan=0 so emitGlyph lands at sx,sy.
@@ -333,6 +574,39 @@ fn drawTextScreen(r: *Renderer, vp: Viewport, bytes: []const u8, sx: f32, sy: f3
     for (bytes) |c| {
         if (c >= 32 and c < 127) {
             emitGlyph(vp, x, wy0, c, color);
+        }
+        x += cw;
+    }
+    sgl.end();
+    sgl.disableTexture();
+    sgl.loadDefaultPipeline();
+}
+
+/// Draw text in raw screen space at a fixed pixel scale, independent of canvas zoom.
+/// Overlays (modals, menus) must keep a constant on-screen size even while the
+/// canvas is zoomed, so they can't go through `drawTextScreen` (which scales glyphs
+/// by `pixelScale = zoom * dpi`). `scale` is pixels-per-logical-unit, e.g. max(dpi, 1).
+fn drawTextScreenFixed(r: *Renderer, bytes: []const u8, sx: f32, sy: f32, scale: f32, color: Color) void {
+    const cw = Font.charW() * scale;
+    const ch = Font.charH() * scale;
+    const w = @max(@as(f32, 1), @round(cw));
+    const h = @max(@as(f32, 1), @round(ch));
+    sgl.loadPipeline(r.pip_blend);
+    sgl.enableTexture();
+    sgl.texture(r.atlas_view, r.atlas_smp);
+    sgl.beginQuads();
+    var x = sx;
+    for (bytes) |c| {
+        if (c >= 32 and c < 127) {
+            const uv = Font.glyphUv(c);
+            const x0 = @floor(x + 0.5);
+            const y0 = @floor(sy + 0.5);
+            const x1 = x0 + w;
+            const y1 = y0 + h;
+            sgl.v2fT2fC4f(x0, y0, uv.u_min, uv.v_min, color.r, color.g, color.b, color.a);
+            sgl.v2fT2fC4f(x1, y0, uv.u_max, uv.v_min, color.r, color.g, color.b, color.a);
+            sgl.v2fT2fC4f(x1, y1, uv.u_max, uv.v_max, color.r, color.g, color.b, color.a);
+            sgl.v2fT2fC4f(x0, y1, uv.u_min, uv.v_max, color.r, color.g, color.b, color.a);
         }
         x += cw;
     }
@@ -656,13 +930,21 @@ fn drawOneBubble(
         if (b.dirty) {
             title_slice = std.fmt.bufPrint(&title_buf, "* {s}", .{b.title}) catch b.title;
         }
+        // Leave room for the close button on the right.
+        const close_reserve = bubble_mod.Bubble.close_btn_size + bubble_mod.Bubble.close_btn_pad * 2;
         const title_box = BoundingBox{
             .x = b.bounds.x + b.pad_x,
             .y = b.bounds.y + 3,
-            .w = @max(0, b.bounds.w - b.pad_x * 2),
+            .w = @max(0, b.bounds.w - b.pad_x * 2 - close_reserve),
             .h = crumb_h - 4,
         };
         drawTextLineClipped(r, vp, title_slice, title_box, text_title, null, 0, null, null);
+    }
+
+    // Title-bar remove control (×) — only on the focused bubble.
+    const show_close = focused_id != null and focused_id.? == b.id;
+    if (crumb_h > 8 and show_close) {
+        drawCloseButton(vp, b.closeButtonBounds(), is_hover or is_active);
     }
 
     const body = b.displayText(store);

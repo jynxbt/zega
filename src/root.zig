@@ -11,6 +11,7 @@ pub const detect = @import("lang/detect.zig");
 pub const outline = @import("lang/outline.zig");
 pub const highlight = @import("lang/highlight.zig");
 pub const brackets = @import("lang/brackets.zig");
+pub const complete = @import("lang/complete.zig");
 pub const edit = @import("edit.zig");
 pub const layout = @import("layout.zig");
 pub const connection = @import("connection.zig");
@@ -39,6 +40,7 @@ test {
     _ = outline;
     _ = highlight;
     _ = brackets;
+    _ = complete;
     // edit/layout pull sokol? no — pure
     _ = edit;
     // layout embeds files and uses spacer — ok for tests

@@ -137,6 +137,66 @@ pub const Editor = struct {
         });
     }
 
+    /// Replace `prefix_len` characters before the caret with `text` (completion accept).
+    pub fn replacePrefix(
+        self: *Editor,
+        store: *DocumentStore,
+        canvas: *Canvas,
+        bubble_id: BubbleId,
+        prefix_len: u32,
+        text: []const u8,
+    ) !void {
+        const b = canvas.findBubble(bubble_id) orelse return;
+        b.selection.clear();
+        if (prefix_len == 0) {
+            try self.insertText(store, canvas, bubble_id, text);
+            return;
+        }
+        if (b.fragment() == null) {
+            // Notes: simple col-based replace on flat text.
+            const col = @min(b.caret.col, @as(u32, @intCast(b.text.len)));
+            const start = if (col >= prefix_len) col - prefix_len else 0;
+            var list: std.ArrayListUnmanaged(u8) = .empty;
+            defer list.deinit(self.allocator);
+            try list.appendSlice(self.allocator, b.text[0..start]);
+            try list.appendSlice(self.allocator, text);
+            try list.appendSlice(self.allocator, b.text[col..]);
+            if (b.text.len != 0) self.allocator.free(b.text);
+            b.text = try list.toOwnedSlice(self.allocator);
+            b.caret.col = start + @as(u32, @intCast(text.len));
+            b.dirty = true;
+            return;
+        }
+        try self.ensureDetached(store, b);
+        const local = b.local_text orelse return;
+        const line = b.caret.line;
+        const col = @min(b.caret.col, @as(u32, @intCast(bubble_mod.lineSliceOf(local, line).len)));
+        const start_col = if (col >= prefix_len) col - prefix_len else 0;
+        const start_off = bubble_mod.offsetAtOf(local, line, start_col);
+        const end_off = bubble_mod.offsetAtOf(local, line, col);
+        const removed = try self.allocator.dupe(u8, local[start_off..end_off]);
+
+        var list: std.ArrayListUnmanaged(u8) = .empty;
+        defer list.deinit(self.allocator);
+        try list.appendSlice(self.allocator, local[0..start_off]);
+        try list.appendSlice(self.allocator, text);
+        try list.appendSlice(self.allocator, local[end_off..]);
+        self.allocator.free(local);
+        b.local_text = try list.toOwnedSlice(self.allocator);
+        b.caret.col = start_col + @as(u32, @intCast(text.len));
+        b.dirty = true;
+        clampCaret(store, b);
+
+        const ins_copy = try self.allocator.dupe(u8, text);
+        try self.pushUndo(.{
+            .doc = b.fragment().?.doc,
+            .bubble = bubble_id,
+            .offset = start_off,
+            .removed = removed,
+            .inserted = ins_copy,
+        });
+    }
+
     pub fn backspace(
         self: *Editor,
         store: *DocumentStore,
@@ -259,7 +319,7 @@ pub const Editor = struct {
             return;
         }
 
-        const local = b.local_text.?;
+        var local = b.local_text.?;
         const base_start = b.local_base_start;
         const base_end = b.local_base_end;
 
@@ -272,20 +332,38 @@ pub const Editor = struct {
         else
             @intCast(doc.bytes.items.len);
 
+        // Line-aligned mid-file ranges (imports, single-line items) always include a
+        // trailing `\n` from rangeSlice. If the user deletes that "empty" last line
+        // (lineCountOf counts it), local loses `\n` and saving would glue the next
+        // function onto this line AND set exclusive end == start → empty bubble.
+        const old_ended_at_line = base_end < doc.lineCount() or
+            (base_end >= doc.lineCount() and end_off == doc.bytes.items.len);
+        if (local.len > 0 and local[local.len - 1] != '\n' and old_ended_at_line and base_end > base_start) {
+            const buf = try self.allocator.alloc(u8, local.len + 1);
+            @memcpy(buf[0..local.len], local);
+            buf[local.len] = '\n';
+            self.allocator.free(b.local_text.?);
+            b.local_text = buf;
+            local = buf;
+        }
+
         const old_len = end_off -% start_off;
         try doc.bytes.replaceRange(self.allocator, start_off, old_len, local);
         try doc.rebuildLineIndex(self.allocator);
         doc.dirty = true;
 
-        // Compute the new half-open end line from the byte just after the splice.
-        // Do NOT use lineCountOf(local): a mid-file rangeSlice always ends with `\n`,
-        // so lineCountOf over-counts by one empty line and every save expands the
-        // bubble into the next fragment (neighbors shift, content bleeds together).
+        // Half-open exclusive end line after the splice.
+        // - Exactly on a line start → that line index is the exclusive end.
+        // - Mid-line → exclusive end is line+1 (content still occupies that line).
+        // Never use bare lineCountOf(local) (trailing `\n` over-counts by one).
         const new_end_off: u32 = start_off + @as(u32, @intCast(local.len));
-        const new_end_line: u32 = if (new_end_off >= doc.bytes.items.len)
-            doc.lineCount()
-        else
-            doc.lineColAt(new_end_off).line;
+        const new_end_line: u32 = blk: {
+            if (local.len == 0) break :blk base_start;
+            if (new_end_off >= doc.bytes.items.len) break :blk doc.lineCount();
+            const lc = doc.lineColAt(new_end_off);
+            if (lc.col == 0) break :blk lc.line;
+            break :blk lc.line + 1;
+        };
 
         const line_delta: i32 = @as(i32, @intCast(new_end_line)) - @as(i32, @intCast(base_end));
         // Update this bubble's fragment range to match merged text.
@@ -1231,6 +1309,69 @@ test "save with inserted newline shifts only following bubbles" {
     try std.testing.expectEqual(@as(u32, 7), bb.fragment().?.end_line);
     try std.testing.expect(std.mem.indexOf(u8, ba.displayText(&store), "fn b") == null);
     try std.testing.expect(std.mem.indexOf(u8, bb.displayText(&store), "fn b") != null);
+
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+}
+
+test "save single-line import without trailing nl keeps bubble non-empty" {
+    // Regression: import bubble showed empty after save when local lost the `\n`.
+    var store = DocumentStore.init(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    const original =
+        \\const std = @import("std");
+        \\
+        \\pub fn main() void {}
+        \\
+    ;
+    const path = "testdata/_import_save.zig";
+    std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    const id = try store.openOrCreate(path, original);
+    {
+        const d = store.get(id).?;
+        d.bytes.clearRetainingCapacity();
+        try d.bytes.appendSlice(std.testing.allocator, original);
+        try d.rebuildLineIndex(std.testing.allocator);
+        d.dirty = false;
+    }
+
+    var canvas = Canvas.init(std.testing.allocator);
+    defer canvas.deinit();
+    const imp_id = try canvas.addBubble(.imports, .{ .x = 0, .y = 0, .w = 100, .h = 40 });
+    const main_id = try canvas.addBubble(.code, .{ .x = 120, .y = 0, .w = 100, .h = 40 });
+    const imp = canvas.findBubble(imp_id).?;
+    const main_b = canvas.findBubble(main_id).?;
+    imp.setFragment(id, 0, 1);
+    try imp.setTitleOwned(std.testing.allocator, "[import] std - t.zig");
+    main_b.setFragment(id, 2, 4);
+
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+    // Detach then strip trailing newline (simulates deleting the phantom empty line).
+    try ed.insertText(&store, &canvas, imp_id, "");
+    // Force local without trailing \n.
+    if (imp.local_text) |lt| {
+        if (lt.len > 0 and lt[lt.len - 1] == '\n') {
+            const trimmed = try std.testing.allocator.dupe(u8, lt[0 .. lt.len - 1]);
+            std.testing.allocator.free(lt);
+            imp.local_text = trimmed;
+        }
+    } else {
+        imp.local_text = try std.testing.allocator.dupe(u8, "const std = @import(\"std\");");
+        imp.local_base_start = 0;
+        imp.local_base_end = 1;
+        imp.dirty = true;
+    }
+    // Ensure text still has import content.
+    try std.testing.expect(std.mem.indexOf(u8, imp.local_text.?, "@import") != null);
+
+    try ed.saveBubble(&store, &canvas, imp_id);
+
+    try std.testing.expect(imp.fragment().?.end_line > imp.fragment().?.start_line);
+    try std.testing.expect(std.mem.indexOf(u8, imp.displayText(&store), "@import") != null);
+    try std.testing.expect(std.mem.indexOf(u8, store.get(id).?.bytes.items, "@import") != null);
+    try std.testing.expect(std.mem.indexOf(u8, store.get(id).?.bytes.items, "pub fn main") != null);
+    // Must not glue import to main.
+    try std.testing.expect(std.mem.indexOf(u8, store.get(id).?.bytes.items, ");pub fn") == null);
 
     std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 }

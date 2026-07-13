@@ -207,6 +207,35 @@ pub const Canvas = struct {
         return null;
     }
 
+    /// Remove a bubble and any connections that reference it.
+    pub fn removeBubble(self: *Canvas, id: BubbleId) void {
+        // Drop connections first.
+        var ci: usize = 0;
+        while (ci < self.connections.items.len) {
+            const c = self.connections.items[ci];
+            if (c.from.bubble == id or c.to.bubble == id) {
+                _ = self.connections.orderedRemove(ci);
+            } else {
+                ci += 1;
+            }
+        }
+        if (self.indexOf(id)) |idx| {
+            self.bubbles.items[idx].deinit(self.allocator);
+            _ = self.bubbles.orderedRemove(idx);
+        }
+        // Strip from working-set membership lists.
+        for (self.groups.items) |*g| {
+            var mi: usize = 0;
+            while (mi < g.members.items.len) {
+                if (g.members.items[mi] == id) {
+                    _ = g.members.orderedRemove(mi);
+                } else {
+                    mi += 1;
+                }
+            }
+        }
+    }
+
     /// Top-most bubble under a world point (for hit testing).
     pub fn hitTest(self: *const Canvas, world: geom.Vec2) ?BubbleId {
         var best: ?BubbleId = null;

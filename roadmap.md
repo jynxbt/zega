@@ -53,7 +53,8 @@ Paper used Eclipse; zega targets **zls** + **rust-analyzer**.
 - [ ] Goto-def / references / hover via LSP
 - [x] Diagnostics (error box under bubble; structure + `zig ast-check`)
 - [x] Bracket pair colorization (nested rainbow + active pair at caret)
-- [ ] Completions (file + working-set aware)
+- [x] Completions v1 (local keywords/builtins/symbols; file + working-set)
+- [ ] Completions via zls (LSP)
 - [ ] Format (`zig fmt`, `rustfmt`)
 
 ## Phase 5 — Heterogeneous bubbles (§6.2)

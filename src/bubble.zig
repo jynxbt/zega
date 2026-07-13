@@ -312,6 +312,27 @@ pub const Bubble = struct {
         return self.titleBarBounds().containsPoint(world);
     }
 
+    /// Size of the × remove control in the title bar (world units).
+    pub const close_btn_size: f32 = 14;
+    pub const close_btn_pad: f32 = 4;
+
+    /// Top-right close button rect inside the title bar.
+    pub fn closeButtonBounds(self: Bubble) geom.BoundingBox {
+        const tb = self.titleBarBounds();
+        const s = close_btn_size;
+        const p = close_btn_pad;
+        return .{
+            .x = tb.x + tb.w - s - p,
+            .y = tb.y + @max(0, (tb.h - s) * 0.5),
+            .w = s,
+            .h = s,
+        };
+    }
+
+    pub fn hitCloseButton(self: Bubble, world: geom.Vec2) bool {
+        return self.closeButtonBounds().containsPoint(world);
+    }
+
     pub fn heightForLines(self: Bubble, visible_line_count: u32) f32 {
         return self.pad_y + self.pad_x + @as(f32, @floatFromInt(visible_line_count)) * self.line_height;
     }
