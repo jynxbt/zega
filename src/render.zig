@@ -1,0 +1,1601 @@
+//! Immediate-mode 2D drawing for the virtual canvas via sokol-gl.
+//! Coordinates: world space → screen via Viewport, then sgl ortho (y-down).
+
+const std = @import("std");
+const sokol = @import("sokol");
+const sg = sokol.gfx;
+const sgl = sokol.gl;
+const sapp = sokol.app;
+
+const geom = @import("geom.zig");
+const canvas_mod = @import("canvas.zig");
+const bubble_mod = @import("bubble.zig");
+const font_mod = @import("font.zig");
+const text_mod = @import("text.zig");
+const doc_mod = @import("doc.zig");
+const highlight = @import("lang/highlight.zig");
+const detect = @import("lang/detect.zig");
+const connection_mod = @import("connection.zig");
+const diag_mod = @import("diag.zig");
+const brackets_mod = @import("lang/brackets.zig");
+
+pub const Canvas = canvas_mod.Canvas;
+pub const Viewport = canvas_mod.Viewport;
+pub const BoundingBox = geom.BoundingBox;
+pub const BubbleKind = bubble_mod.BubbleKind;
+pub const Font = font_mod.Font;
+pub const DocumentStore = doc_mod.DocumentStore;
+pub const DiagStore = diag_mod.DiagStore;
+pub const BracketStore = brackets_mod.BracketStore;
+
+pub const Color = struct {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32 = 1.0,
+
+    pub fn rgb(r: f32, g: f32, b: f32) Color {
+        return .{ .r = r, .g = g, .b = b, .a = 1.0 };
+    }
+
+    pub fn rgba(r: f32, g: f32, b: f32, a: f32) Color {
+        return .{ .r = r, .g = g, .b = b, .a = a };
+    }
+};
+
+/// Pastel working-set halo palette (paper §6.3: auto-assigned colored halo).
+pub const halo_palette = [_]Color{
+    Color.rgba(0.35, 0.55, 0.95, 0.22),
+    Color.rgba(0.95, 0.55, 0.35, 0.22),
+    Color.rgba(0.40, 0.80, 0.50, 0.22),
+    Color.rgba(0.80, 0.45, 0.85, 0.22),
+    Color.rgba(0.95, 0.80, 0.30, 0.22),
+    Color.rgba(0.40, 0.75, 0.85, 0.22),
+};
+
+pub const clear_color = Color.rgb(0.12, 0.13, 0.15);
+const grid_color = Color.rgba(1.0, 1.0, 1.0, 0.50);
+const grid_major_color = Color.rgba(1.0, 1.0, 1.0, 0.50);
+
+const bubble_fill_code = Color.rgb(0.18, 0.20, 0.24);
+const bubble_fill_note = Color.rgb(0.28, 0.24, 0.16);
+const bubble_fill_other = Color.rgb(0.20, 0.22, 0.20);
+/// Imports: cool teal so dependency chrome is distinct from function bodies.
+const bubble_fill_imports = Color.rgb(0.14, 0.22, 0.24);
+const bubble_border_imports = Color.rgb(0.40, 0.70, 0.72);
+const bubble_border = Color.rgb(0.55, 0.58, 0.65);
+const bubble_border_active = Color.rgb(0.85, 0.90, 1.0);
+const breadcrumb_fill = Color.rgba(0.0, 0.0, 0.0, 0.25);
+/// Corner radius in **world** units (scales with zoom for a stable look).
+const bubble_corner_r: f32 = 8.0;
+/// Segments per quarter-circle for rounded corners.
+const corner_segments: u32 = 8;
+const text_body = Color.rgb(0.85, 0.87, 0.90);
+const text_title = Color.rgb(0.75, 0.78, 0.85);
+const text_note = Color.rgb(0.92, 0.88, 0.75);
+/// Solid block caret (no blink) — bright orange like a terminal/editor insert cursor.
+const caret_block = Color.rgb(1.0, 0.55, 0.12);
+/// Glyph drawn on top of the block (dark on orange).
+const caret_glyph = Color.rgb(0.12, 0.08, 0.04);
+
+const error_box_fill = Color.rgba(0.32, 0.10, 0.10, 0.94);
+const error_box_border = Color.rgb(0.92, 0.38, 0.38);
+const error_box_text = Color.rgb(0.96, 0.78, 0.78);
+const bubble_border_error = Color.rgb(0.90, 0.40, 0.40);
+
+/// Halo expand distance in world units.
+pub const halo_pad: f32 = 20.0;
+/// World-space grid step.
+pub const grid_step: f32 = 64.0;
+/// Gap between bubble bottom and error panel.
+const error_box_gap: f32 = 6.0;
+const error_box_pad: f32 = 6.0;
+const error_box_max_lines: usize = 5;
+
+pub const Renderer = struct {
+    pass_action: sg.PassAction = .{},
+    /// Alpha-blended pipeline for halos / soft fills / text.
+    pip_blend: sgl.Pipeline = .{},
+
+    atlas_img: sg.Image = .{},
+    atlas_view: sg.View = .{},
+    atlas_smp: sg.Sampler = .{},
+
+    /// Scratch for reflow display lines (reused each frame).
+    reflow_lines: std.ArrayListUnmanaged(text_mod.DisplayLine) = .empty,
+    highlight_spans: std.ArrayListUnmanaged(highlight.Span) = .empty,
+    /// Full logical line buffer for highlighter when drawing wrap segments.
+    logical_line_buf: std.ArrayListUnmanaged(u8) = .empty,
+    allocator: std.mem.Allocator = undefined,
+
+    pub fn init(self: *Renderer, allocator: std.mem.Allocator) void {
+        self.allocator = allocator;
+        self.pass_action.colors[0] = .{
+            .load_action = .CLEAR,
+            .clear_value = .{
+                .r = clear_color.r,
+                .g = clear_color.g,
+                .b = clear_color.b,
+                .a = 1.0,
+            },
+        };
+        var pip_desc: sg.PipelineDesc = .{};
+        pip_desc.colors[0].blend = .{
+            .enabled = true,
+            .src_factor_rgb = .SRC_ALPHA,
+            .dst_factor_rgb = .ONE_MINUS_SRC_ALPHA,
+            .src_factor_alpha = .ONE,
+            .dst_factor_alpha = .ONE_MINUS_SRC_ALPHA,
+        };
+        self.pip_blend = sgl.makePipeline(pip_desc);
+
+        // Bake JetBrains Mono atlas and upload.
+        var pixels: [font_mod.max_atlas_pixels]u8 = undefined;
+        if (!Font.bakeRgba(&pixels)) {
+            std.log.err("failed to bake JetBrains Mono font atlas", .{});
+        }
+        const aw = font_mod.atlas_w;
+        const ah = font_mod.atlas_h;
+        const byte_len = aw * ah * 4;
+
+        self.atlas_img = sg.makeImage(.{
+            .width = @intCast(aw),
+            .height = @intCast(ah),
+            .pixel_format = .RGBA8,
+            .data = init: {
+                var data: sg.ImageData = .{};
+                data.mip_levels[0] = sg.asRange(pixels[0..byte_len]);
+                break :init data;
+            },
+        });
+        self.atlas_view = sg.makeView(.{ .texture = .{ .image = self.atlas_img } });
+        // LINEAR on a *supersampled* atlas → sharp downsample on HiDPI.
+        // (LINEAR on a 1× atlas looked blurry; the supersample is the fix.)
+        self.atlas_smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+        });
+    }
+
+    pub fn deinit(self: *Renderer) void {
+        self.reflow_lines.deinit(self.allocator);
+        self.highlight_spans.deinit(self.allocator);
+        self.logical_line_buf.deinit(self.allocator);
+        // Image/view/sampler destroyed with sg.shutdown if not destroyed here.
+        if (self.atlas_view.id != 0) sg.destroyView(self.atlas_view);
+        if (self.atlas_smp.id != 0) sg.destroySampler(self.atlas_smp);
+        if (self.atlas_img.id != 0) sg.destroyImage(self.atlas_img);
+        self.* = .{};
+    }
+
+    pub fn draw(
+        self: *Renderer,
+        canvas: *const Canvas,
+        store: *const DocumentStore,
+        diags: *const DiagStore,
+        brackets: *const BracketStore,
+        active_id: ?bubble_mod.BubbleId,
+        focused_id: ?bubble_mod.BubbleId,
+        hover_id: ?bubble_mod.BubbleId,
+        hover_amount: f32,
+        link_hl: ?LinkHighlight,
+        menu: ?ContextMenuView,
+    ) void {
+        const vp = canvas.viewport;
+        const w = vp.screen_w;
+        const h = vp.screen_h;
+        if (w <= 0 or h <= 0) return;
+
+        sgl.defaults();
+        sgl.matrixModeProjection();
+        // Screen space, origin top-left, +y down (matches Viewport).
+        sgl.ortho(0, w, h, 0, -1, 1);
+        sgl.matrixModeModelview();
+        sgl.loadIdentity();
+
+        drawGrid(self, vp);
+        drawHalos(self, canvas);
+        // Links under bubbles (paper 1-M rectilinear arrows).
+        drawConnections(self, canvas, focused_id, hover_id, hover_amount, link_hl);
+        drawBubbles(self, canvas, store, diags, brackets, active_id, focused_id, hover_id, hover_amount, link_hl);
+        if (menu) |m| {
+            if (m.open) drawContextMenu(self, vp, m);
+        }
+    }
+
+    pub fn passAction(self: *const Renderer) sg.PassAction {
+        return self.pass_action;
+    }
+};
+
+/// Screen-space context menu (drawn after world content).
+pub const ContextMenuView = struct {
+    open: bool = false,
+    /// Top-left in framebuffer / screen pixels.
+    x: f32 = 0,
+    y: f32 = 0,
+    /// Index of hovered item, or -1.
+    hover_item: i32 = -1,
+};
+
+pub const context_menu_item_h: f32 = 28;
+pub const context_menu_w: f32 = 180;
+pub const context_menu_pad: f32 = 6;
+/// Labels for menu rows (extend as needed).
+pub const context_menu_labels = [_][]const u8{
+    "Create new file",
+};
+
+pub fn contextMenuItemCount() usize {
+    return context_menu_labels.len;
+}
+
+pub fn contextMenuHeight() f32 {
+    return context_menu_pad * 2 + context_menu_item_h * @as(f32, @floatFromInt(context_menu_labels.len));
+}
+
+/// Returns item index under screen point, or null. `dpi` matches draw scaling.
+pub fn contextMenuHit(menu: ContextMenuView, sx: f32, sy: f32, dpi: f32) ?usize {
+    if (!menu.open) return null;
+    const scale = @max(dpi, 1.0);
+    const mw = context_menu_w * scale;
+    const ih = context_menu_item_h * scale;
+    const pad = context_menu_pad * scale;
+    const mh = pad * 2 + ih * @as(f32, @floatFromInt(context_menu_labels.len));
+
+    const mx = menu.x;
+    const my = menu.y;
+    if (sx < mx or sy < my) return null;
+    if (sx >= mx + mw or sy >= my + mh) return null;
+    const rel_y = sy - my - pad;
+    if (rel_y < 0) return null;
+    const idx: i32 = @intFromFloat(@floor(rel_y / ih));
+    if (idx < 0 or idx >= context_menu_labels.len) return null;
+    return @intCast(idx);
+}
+
+const menu_bg = Color.rgb(0.16, 0.17, 0.20);
+const menu_border = Color.rgb(0.40, 0.42, 0.48);
+const menu_hover = Color.rgb(0.28, 0.32, 0.42);
+const menu_text = Color.rgb(0.90, 0.91, 0.93);
+
+const conn_color = Color.rgba(0.45, 0.72, 0.88, 0.85);
+const conn_color_active = Color.rgba(0.55, 0.85, 1.0, 0.95);
+/// Neon core when a link is hovered (GlowRays-style bloom + bright spine).
+const conn_color_hover = Color.rgba(1.0, 0.88, 0.35, 1.0);
+const conn_glow_hover = Color.rgb(1.0, 0.72, 0.15);
+const link_bubble_border = Color.rgb(1.0, 0.78, 0.28);
+const selection_bg = Color.rgba(0.30, 0.50, 0.85, 0.35);
+
+/// Highlight call site / endpoints when an arrow is hovered.
+pub const LinkHighlight = struct {
+    conn_id: bubble_mod.ConnectionId,
+    from_bubble: bubble_mod.BubbleId,
+    to_bubble: bubble_mod.BubbleId,
+    /// Absolute document line of the call (0-based).
+    call_line: ?u32 = null,
+    call_col_start: ?u32 = null,
+    call_col_end: ?u32 = null,
+};
+
+fn drawContextMenu(r: *Renderer, vp: Viewport, menu: ContextMenuView) void {
+    const scale = @max(vp.dpi, 1.0);
+    const mw = context_menu_w * scale;
+    const ih = context_menu_item_h * scale;
+    const pad = context_menu_pad * scale;
+    const mh = pad * 2 + ih * @as(f32, @floatFromInt(context_menu_labels.len));
+
+    // Keep menu on-screen.
+    var mx = menu.x;
+    var my = menu.y;
+    if (mx + mw > vp.screen_w) mx = vp.screen_w - mw;
+    if (my + mh > vp.screen_h) my = vp.screen_h - mh;
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+
+    // Panel
+    fillScreenRect(mx, my, mx + mw, my + mh, menu_bg);
+    const bt = @max(1.0, scale);
+    strokeScreenRect(mx, my, mx + mw, my + mh, menu_border, bt);
+
+    for (context_menu_labels, 0..) |label, i| {
+        const iy0 = my + pad + @as(f32, @floatFromInt(i)) * ih;
+        const iy1 = iy0 + ih;
+        if (menu.hover_item == @as(i32, @intCast(i))) {
+            fillScreenRect(mx + 2 * scale, iy0, mx + mw - 2 * scale, iy1, menu_hover);
+        }
+        // Draw label in screen space: convert screen box back to "fake" world
+        // by using emitGlyph with a temporary 1:1 mapping via drawTextScreen.
+        drawTextScreen(r, vp, label, mx + pad + 4 * scale, iy0 + (ih - Font.charH() * vp.pixelScale()) * 0.5, menu_text);
+    }
+}
+
+/// Draw text starting at screen-pixel position (for UI chrome).
+fn drawTextScreen(r: *Renderer, vp: Viewport, bytes: []const u8, sx: f32, sy: f32, color: Color) void {
+    // Inverse of worldToScreen at pan=0 so emitGlyph lands at sx,sy.
+    // world = screen / pixelScale + pan; with pan 0: world = screen / pixelScale
+    const s = vp.pixelScale();
+    if (s <= 0) return;
+    const world_y = sy / s; // assuming pan handled... emitGlyph uses full viewport pan.
+    // Compensate pan so worldToScreen(world) ≈ screen:
+    // (world - pan) * s = screen => world = screen/s + pan
+    const wx0 = sx / s + vp.pan.x;
+    const wy0 = world_y + vp.pan.y;
+
+    sgl.loadPipeline(r.pip_blend);
+    sgl.enableTexture();
+    sgl.texture(r.atlas_view, r.atlas_smp);
+    sgl.beginQuads();
+    const cw = Font.charW();
+    var x = wx0;
+    for (bytes) |c| {
+        if (c >= 32 and c < 127) {
+            emitGlyph(vp, x, wy0, c, color);
+        }
+        x += cw;
+    }
+    sgl.end();
+    sgl.disableTexture();
+    sgl.loadDefaultPipeline();
+}
+
+fn drawGrid(r: *Renderer, vp: Viewport) void {
+    const visible = vp.visibleWorldBounds();
+    const step = grid_step;
+    const start_x = @floor(visible.x / step) * step;
+    const start_y = @floor(visible.y / step) * step;
+    const end_x = visible.right();
+    const end_y = visible.bottom();
+
+    // Alpha only works with the blended pipeline.
+    sgl.loadPipeline(r.pip_blend);
+    sgl.beginLines();
+    var x = start_x;
+    while (x <= end_x) : (x += step) {
+        const major = @mod(@abs(x / step), 4) < 0.5;
+        const c = if (major) grid_major_color else grid_color;
+        const a = vp.worldToScreen(.{ .x = x, .y = visible.y });
+        const b = vp.worldToScreen(.{ .x = x, .y = end_y });
+        sgl.v2fC4f(a.x, a.y, c.r, c.g, c.b, c.a);
+        sgl.v2fC4f(b.x, b.y, c.r, c.g, c.b, c.a);
+    }
+    var y = start_y;
+    while (y <= end_y) : (y += step) {
+        const major = @mod(@abs(y / step), 4) < 0.5;
+        const c = if (major) grid_major_color else grid_color;
+        const a = vp.worldToScreen(.{ .x = visible.x, .y = y });
+        const b = vp.worldToScreen(.{ .x = end_x, .y = y });
+        sgl.v2fC4f(a.x, a.y, c.r, c.g, c.b, c.a);
+        sgl.v2fC4f(b.x, b.y, c.r, c.g, c.b, c.a);
+    }
+    sgl.end();
+    sgl.loadDefaultPipeline();
+}
+
+fn drawHalos(r: *Renderer, canvas: *const Canvas) void {
+    if (canvas.groups.items.len == 0) return;
+
+    sgl.loadPipeline(r.pip_blend);
+    for (canvas.groups.items) |group| {
+        const world_box = canvas.groupBounds(group.id) orelse continue;
+        const padded = world_box.expanded(halo_pad);
+        const c = halo_palette[group.color_index % halo_palette.len];
+        fillWorldRect(canvas.viewport, padded, c);
+    }
+    sgl.loadDefaultPipeline();
+}
+
+fn drawConnections(
+    r: *Renderer,
+    canvas: *const Canvas,
+    focused_id: ?bubble_mod.BubbleId,
+    hover_id: ?bubble_mod.BubbleId,
+    hover_amount: f32,
+    link_hl: ?LinkHighlight,
+) void {
+    if (canvas.connections.items.len == 0) return;
+
+    const vp = canvas.viewport;
+    const base_thick = 2.5 / @max(vp.pixelScale(), 1.0);
+    const arrow_size = 12.0;
+    const hover_scale = 1.0 + (hover_scale_max - 1.0) * std.math.clamp(hover_amount, 0, 1);
+
+    sgl.loadPipeline(r.pip_blend);
+
+    for (canvas.connections.items) |conn| {
+        const from_b = canvas.findBubbleConst(conn.from.bubble) orelse continue;
+        const to_b = canvas.findBubbleConst(conn.to.bubble) orelse continue;
+
+        var from_box = from_b.bounds;
+        var to_box = to_b.bounds;
+        if (hover_id != null and hover_amount > 0.001) {
+            if (hover_id.? == from_b.id) from_box = scaledBox(from_box, hover_scale);
+            if (hover_id.? == to_b.id) to_box = scaledBox(to_box, hover_scale);
+        }
+
+        const on_link = link_hl != null and link_hl.?.conn_id == conn.id;
+        const active = on_link or
+            (focused_id != null and (focused_id.? == from_b.id or focused_id.? == to_b.id)) or
+            (hover_id != null and (hover_id.? == from_b.id or hover_id.? == to_b.id));
+        const col = if (on_link) conn_color_hover else if (active) conn_color_active else conn_color;
+        const thick = if (on_link) base_thick * 1.8 else if (active) base_thick * 1.25 else base_thick;
+
+        const pl = connection_mod.routeRectilinear(from_box, to_box);
+        if (pl.len < 2) continue;
+
+        // Neon bloom under the spine when this link is highlighted (GlowRays-style).
+        if (on_link) {
+            strokePolylineGlow(vp, pl, thick, conn_glow_hover);
+        }
+
+        var i: u8 = 1;
+        while (i < pl.len) : (i += 1) {
+            strokeWorldSegment(vp, pl.points[i - 1], pl.points[i], thick, col);
+        }
+
+        if (connection_mod.arrowHead(pl, if (on_link) arrow_size * 1.35 else arrow_size)) |ah| {
+            if (on_link) fillWorldTriangleGlow(vp, ah.tip, ah.left, ah.right, conn_glow_hover);
+            fillWorldTriangle(vp, ah.tip, ah.left, ah.right, col);
+        }
+    }
+
+    sgl.loadDefaultPipeline();
+}
+
+fn scaledBox(b: BoundingBox, scale: f32) BoundingBox {
+    if (@abs(scale - 1.0) < 0.001) return b;
+    const c = b.center();
+    const nw = b.w * scale;
+    const nh = b.h * scale;
+    return .{
+        .x = c.x - nw * 0.5,
+        .y = c.y - nh * 0.5,
+        .w = nw,
+        .h = nh,
+    };
+}
+
+fn strokeWorldSegment(vp: Viewport, a: geom.Vec2, b: geom.Vec2, thick: f32, c: Color) void {
+    const sa = vp.worldToScreen(a);
+    const sb = vp.worldToScreen(b);
+    var dx = sb.x - sa.x;
+    var dy = sb.y - sa.y;
+    const len = @sqrt(dx * dx + dy * dy);
+    if (len < 0.5) return;
+    dx /= len;
+    dy /= len;
+    // Screen-space thickness
+    const t = thick * vp.pixelScale() * 0.5;
+    const px = -dy * t;
+    const py = dx * t;
+    // Quad along segment
+    sgl.beginQuads();
+    sgl.v2fC4f(sa.x + px, sa.y + py, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(sa.x - px, sa.y - py, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(sb.x - px, sb.y - py, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(sb.x + px, sb.y + py, c.r, c.g, c.b, c.a);
+    sgl.end();
+}
+
+/// Multi-layer soft bloom along a polyline (outer → inner, additive neon haze).
+fn strokePolylineGlow(vp: Viewport, pl: connection_mod.Polyline, core_thick: f32, tint: Color) void {
+    const layers: u32 = 10;
+    var li: i32 = @intCast(layers);
+    while (li >= 1) : (li -= 1) {
+        const t = @as(f32, @floatFromInt(li)) / @as(f32, @floatFromInt(layers));
+        // Wide outer haze → tighter mid glow (more steps = smoother falloff).
+        const thick = core_thick * (1.0 + t * 9.0);
+        const fall = 1.0 - t;
+        const a = 0.32 * fall * fall * fall + 0.02 * fall;
+        const col = Color.rgba(tint.r, tint.g, tint.b, a);
+        var i: u8 = 1;
+        while (i < pl.len) : (i += 1) {
+            strokeWorldSegment(vp, pl.points[i - 1], pl.points[i], thick, col);
+        }
+    }
+}
+
+/// Soft expanded triangle bloom under a bright arrowhead.
+fn fillWorldTriangleGlow(vp: Viewport, a: geom.Vec2, b: geom.Vec2, c: geom.Vec2, tint: Color) void {
+    const sa = vp.worldToScreen(a);
+    const sb = vp.worldToScreen(b);
+    const sc = vp.worldToScreen(c);
+    const cx = (sa.x + sb.x + sc.x) / 3.0;
+    const cy = (sa.y + sb.y + sc.y) / 3.0;
+    const layers: u32 = 4;
+    var li: u32 = layers;
+    while (li >= 1) : (li -= 1) {
+        const t = @as(f32, @floatFromInt(li)) / @as(f32, @floatFromInt(layers));
+        const scale = 1.0 + t * 1.4;
+        const a_alpha = 0.22 * (1.0 - t) * (1.0 - t);
+        const col = Color.rgba(tint.r, tint.g, tint.b, a_alpha);
+        const ax = cx + (sa.x - cx) * scale;
+        const ay = cy + (sa.y - cy) * scale;
+        const bx = cx + (sb.x - cx) * scale;
+        const by = cy + (sb.y - cy) * scale;
+        const cx2 = cx + (sc.x - cx) * scale;
+        const cy2 = cy + (sc.y - cy) * scale;
+        sgl.beginTriangles();
+        sgl.v2fC4f(ax, ay, col.r, col.g, col.b, col.a);
+        sgl.v2fC4f(bx, by, col.r, col.g, col.b, col.a);
+        sgl.v2fC4f(cx2, cy2, col.r, col.g, col.b, col.a);
+        sgl.end();
+    }
+}
+
+fn fillWorldTriangle(vp: Viewport, a: geom.Vec2, b: geom.Vec2, c: geom.Vec2, col: Color) void {
+    const sa = vp.worldToScreen(a);
+    const sb = vp.worldToScreen(b);
+    const sc = vp.worldToScreen(c);
+    sgl.beginTriangles();
+    sgl.v2fC4f(sa.x, sa.y, col.r, col.g, col.b, col.a);
+    sgl.v2fC4f(sb.x, sb.y, col.r, col.g, col.b, col.a);
+    sgl.v2fC4f(sc.x, sc.y, col.r, col.g, col.b, col.a);
+    sgl.end();
+}
+
+/// Peak scale when fully hovered (1.0 = no change).
+const hover_scale_max: f32 = 1.07;
+
+/// Per-line bracket coloring context (absolute document offsets).
+const BracketDrawCtx = struct {
+    index: *const brackets_mod.BracketIndex,
+    /// Absolute byte offset of the start of the current logical line.
+    line_abs_start: u32,
+    active_open: ?u32 = null,
+    active_close: ?u32 = null,
+};
+
+fn drawBubbles(
+    r: *Renderer,
+    canvas: *const Canvas,
+    store: *const DocumentStore,
+    diags: *const DiagStore,
+    brackets: *const BracketStore,
+    active_id: ?bubble_mod.BubbleId,
+    focused_id: ?bubble_mod.BubbleId,
+    hover_id: ?bubble_mod.BubbleId,
+    hover_amount: f32,
+    link_hl: ?LinkHighlight,
+) void {
+    const vp = canvas.viewport;
+
+    // Draw non-hovered first, then hovered on top so scale sits above neighbors.
+    var pass: u32 = 0;
+    while (pass < 2) : (pass += 1) {
+        for (canvas.bubbles.items) |b| {
+            const is_focused_b = focused_id != null and focused_id.? == b.id;
+            // No hover chrome/scale on the bubble you're already editing.
+            const is_hover = hover_id != null and hover_id.? == b.id and hover_amount > 0.001 and !is_focused_b;
+            const on_link = link_hl != null and (link_hl.?.from_bubble == b.id or link_hl.?.to_bubble == b.id);
+            if (pass == 0 and (is_hover or on_link)) continue;
+            if (pass == 1 and !(is_hover or on_link)) continue;
+
+            const scale: f32 = if (is_hover)
+                1.0 + (hover_scale_max - 1.0) * std.math.clamp(hover_amount, 0, 1)
+            else
+                1.0;
+
+            if (scale != 1.0) {
+                const c = b.bounds.center();
+                const sc = vp.worldToScreen(c);
+                sgl.matrixModeModelview();
+                sgl.pushMatrix();
+                sgl.translate(sc.x, sc.y, 0);
+                sgl.scale(scale, scale, 1);
+                sgl.translate(-sc.x, -sc.y, 0);
+            }
+
+            drawOneBubble(r, vp, store, diags, brackets, &b, active_id, focused_id, is_hover, link_hl);
+
+            if (scale != 1.0) {
+                sgl.matrixModeModelview();
+                sgl.popMatrix();
+            }
+        }
+    }
+}
+
+fn drawOneBubble(
+    r: *Renderer,
+    vp: Viewport,
+    store: *const DocumentStore,
+    diags: *const DiagStore,
+    brackets: *const BracketStore,
+    b: *const bubble_mod.Bubble,
+    active_id: ?bubble_mod.BubbleId,
+    focused_id: ?bubble_mod.BubbleId,
+    is_hover: bool,
+    link_hl: ?LinkHighlight,
+) void {
+    const fill = switch (b.kind) {
+        .code => bubble_fill_code,
+        .note => bubble_fill_note,
+        .imports => bubble_fill_imports,
+        else => bubble_fill_other,
+    };
+    const is_active = (active_id != null and active_id.? == b.id) or
+        (focused_id != null and focused_id.? == b.id);
+    const on_link = link_hl != null and (link_hl.?.from_bubble == b.id or link_hl.?.to_bubble == b.id);
+    const has_errors = bubbleHasErrors(diags, b);
+    const border = if (on_link)
+        link_bubble_border
+    else if (has_errors)
+        bubble_border_error
+    else if (is_active or is_hover)
+        bubble_border_active
+    else if (b.kind == .imports)
+        bubble_border_imports
+    else
+        bubble_border;
+    // Linked bubbles: clear but not a thick yellow frame that fights the code.
+    const border_w: f32 = if (on_link) 2.0 else if (has_errors) 2.5 else if (is_hover) 2.5 else if (is_active) 2.0 else 1.5;
+
+    fillWorldRoundRect(vp, b.bounds, bubble_corner_r, fill);
+
+    const crumb_h = @min(b.pad_y, b.bounds.h * 0.35);
+    if (crumb_h > 1) {
+        // Title strip with matching top corners so it doesn't square off the bubble.
+        const crumb = BoundingBox{
+            .x = b.bounds.x,
+            .y = b.bounds.y,
+            .w = b.bounds.w,
+            .h = crumb_h,
+        };
+        fillWorldRoundTopRect(vp, crumb, bubble_corner_r, breadcrumb_fill);
+    }
+
+    strokeWorldRoundRect(vp, b.bounds, bubble_corner_r, border, border_w);
+
+    if (b.title.len != 0 and crumb_h > 4) {
+        var title_buf: [320]u8 = undefined;
+        var title_slice: []const u8 = b.title;
+        // Per-bubble dirty star (not whole-document — many bubbles share one file).
+        if (b.dirty) {
+            title_slice = std.fmt.bufPrint(&title_buf, "* {s}", .{b.title}) catch b.title;
+        }
+        const title_box = BoundingBox{
+            .x = b.bounds.x + b.pad_x,
+            .y = b.bounds.y + 3,
+            .w = @max(0, b.bounds.w - b.pad_x * 2),
+            .h = crumb_h - 4,
+        };
+        drawTextLineClipped(r, vp, title_slice, title_box, text_title, null, 0, null, null);
+    }
+
+    const body = b.displayText(store);
+    if (body.len != 0 or b.kind == .code) {
+        const content = b.contentBounds();
+        var lang: detect.Language = .unknown;
+        if (b.fragment()) |f| {
+            if (store.getConst(f.doc)) |d| lang = d.lang;
+        }
+        const is_focused = focused_id != null and focused_id.? == b.id;
+        drawCodeContent(r, vp, store, brackets, body, content, lang, b.kind == .note, b, link_hl, is_focused);
+    }
+
+    if (focused_id != null and focused_id.? == b.id) {
+        drawCaret(r, vp, store, b);
+    }
+
+    if (has_errors) {
+        drawErrorBox(r, vp, diags, b);
+    }
+}
+
+fn bubbleHasErrors(diags: *const DiagStore, b: *const bubble_mod.Bubble) bool {
+    const f = b.fragment() orelse return false;
+    return diags.countInRange(f.doc, f.start_line, f.end_line) > 0;
+}
+
+/// Extra panel under the bubble listing fragment-local diagnostics.
+fn drawErrorBox(
+    r: *Renderer,
+    vp: Viewport,
+    diags: *const DiagStore,
+    b: *const bubble_mod.Bubble,
+) void {
+    const f = b.fragment() orelse return;
+    const all = diags.get(f.doc);
+    if (all.len == 0) return;
+
+    // Collect matching lines (capped).
+    var msgs: [error_box_max_lines]struct { line: u32, msg: []const u8 } = undefined;
+    var n: usize = 0;
+    var total: usize = 0;
+    for (all) |d| {
+        if (d.line < f.start_line or d.line >= f.end_line) continue;
+        total += 1;
+        if (n < error_box_max_lines) {
+            msgs[n] = .{ .line = d.line, .msg = d.message };
+            n += 1;
+        }
+    }
+    if (n == 0) return;
+
+    const ch = Font.charH();
+    const line_h = ch + 2;
+    const header_h = line_h;
+    const box_h = error_box_pad * 2 + header_h + @as(f32, @floatFromInt(n)) * line_h +
+        if (total > n) line_h else 0;
+
+    const box = BoundingBox{
+        .x = b.bounds.x,
+        .y = b.bounds.bottom() + error_box_gap,
+        .w = b.bounds.w,
+        .h = box_h,
+    };
+
+    // Soft backdrop so errors read clearly over the grid.
+    sgl.loadPipeline(r.pip_blend);
+    fillWorldRect(vp, box, error_box_fill);
+    strokeWorldRect(vp, box, error_box_border, 1.5);
+
+    var y = box.y + error_box_pad;
+    const text_x = box.x + error_box_pad;
+    const text_w = @max(0, box.w - error_box_pad * 2);
+
+    var header_buf: [64]u8 = undefined;
+    const header = std.fmt.bufPrint(
+        &header_buf,
+        "{d} issue{s}",
+        .{ total, if (total == 1) "" else "s" },
+    ) catch "issues";
+    drawTextLineClipped(r, vp, header, .{
+        .x = text_x,
+        .y = y,
+        .w = text_w,
+        .h = line_h,
+    }, error_box_border, null, 0, null, null);
+    y += header_h;
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var line_buf: [512]u8 = undefined;
+        // 1-based line numbers for display.
+        const line = std.fmt.bufPrint(
+            &line_buf,
+            "L{d}: {s}",
+            .{ msgs[i].line + 1, msgs[i].msg },
+        ) catch msgs[i].msg;
+        drawTextLineClipped(r, vp, line, .{
+            .x = text_x,
+            .y = y,
+            .w = text_w,
+            .h = line_h,
+        }, error_box_text, null, 0, null, null);
+        y += line_h;
+    }
+
+    if (total > n) {
+        var more_buf: [48]u8 = undefined;
+        const more = std.fmt.bufPrint(
+            &more_buf,
+            "... and {d} more",
+            .{total - n},
+        ) catch "...";
+        drawTextLineClipped(r, vp, more, .{
+            .x = text_x,
+            .y = y,
+            .w = text_w,
+            .h = line_h,
+        }, error_box_text, null, 0, null, null);
+    }
+}
+
+fn drawCodeContent(
+    r: *Renderer,
+    vp: Viewport,
+    store: *const DocumentStore,
+    brackets: *const BracketStore,
+    source: []const u8,
+    content: BoundingBox,
+    lang: detect.Language,
+    is_note: bool,
+    b: *const bubble_mod.Bubble,
+    link_hl: ?LinkHighlight,
+    is_focused: bool,
+) void {
+    if (content.w < 1 or content.h < 1) return;
+
+    const max_cols = text_mod.maxColsForWidth(content.w);
+    r.reflow_lines.clearRetainingCapacity();
+    _ = text_mod.reflow(r.allocator, source, max_cols, &r.reflow_lines) catch return;
+
+    const ch = Font.charH();
+    const cw = Font.charW();
+    var y = content.y;
+    var last_logical: u32 = std.math.maxInt(u32);
+
+    // Map absolute call line → local line within this fragment (if any).
+    var local_call_line: ?u32 = null;
+    var name_cols: ?struct { u32, u32 } = null;
+    var highlight_callee_sig = false;
+    if (link_hl) |lh| {
+        if (b.fragment()) |f| {
+            if (lh.from_bubble == b.id) {
+                if (lh.call_line) |abs| {
+                    if (abs >= f.start_line and abs < f.end_line) {
+                        local_call_line = abs - f.start_line;
+                        if (lh.call_col_start != null and lh.call_col_end != null) {
+                            name_cols = .{ lh.call_col_start.?, lh.call_col_end.? };
+                        }
+                    }
+                }
+            }
+            if (lh.to_bubble == b.id) {
+                highlight_callee_sig = true;
+            }
+        }
+    }
+
+    // Bracket pair index (full document) + caret active pair.
+    var bidx: ?*const brackets_mod.BracketIndex = null;
+    var frag_start_line: u32 = 0;
+    var doc_for_lines: ?*const doc_mod.Document = null;
+    var active_open: ?u32 = null;
+    var active_close: ?u32 = null;
+    if (!is_note) {
+        if (b.fragment()) |f| {
+            frag_start_line = f.start_line;
+            doc_for_lines = store.getConst(f.doc);
+            bidx = brackets.get(f.doc);
+            if (is_focused) {
+                if (bidx) |bi| {
+                    if (doc_for_lines) |d| {
+                        const abs_line = frag_start_line + b.caret.line;
+                        const abs_off = d.offsetAt(abs_line, b.caret.col);
+                        if (bi.pairNear(abs_off)) |pair| {
+                            if (pair.open != std.math.maxInt(u32)) active_open = pair.open;
+                            if (pair.close != std.math.maxInt(u32)) active_close = pair.close;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Soft background under active matching brackets (before text).
+    if (active_open != null or active_close != null) {
+        if (doc_for_lines) |d| {
+            paintActiveBracketBg(vp, content, d, frag_start_line, source, active_open, active_close, cw, ch);
+        }
+    }
+
+    // Text selection wash (logical lines; good enough without wrap-aware ranges).
+    if (is_focused and b.selection.active and !b.selection.isEmpty()) {
+        paintSelection(vp, content, b.selection, cw, ch);
+    }
+
+    for (r.reflow_lines.items) |line| {
+        if (y + ch > content.bottom() + 0.5) break;
+
+        // Link-hover columns within this display segment (absolute → segment-local).
+        var glow_cols: ?struct { u32, u32 } = null; // [start, end) in segment bytes
+        if (local_call_line != null and line.logical_line == local_call_line.? and !line.wrap_continuation) {
+            if (name_cols) |cols| {
+                const seg0 = line.col_offset;
+                const seg1 = line.col_offset + @as(u32, @intCast(line.bytes.len));
+                const a = @max(cols[0], seg0);
+                const b2 = @min(cols[1], seg1);
+                if (b2 > a) glow_cols = .{ a - seg0, b2 - seg0 };
+            } else {
+                glow_cols = .{ 0, @intCast(line.bytes.len) };
+            }
+        }
+        // Callee signature: bloom the whole first line (per-token colors).
+        if (highlight_callee_sig and line.logical_line == 0 and !line.wrap_continuation) {
+            glow_cols = .{ 0, @intCast(line.bytes.len) };
+        }
+
+        if (line.logical_line != last_logical) {
+            last_logical = line.logical_line;
+            fillLogicalLine(r, source, line.logical_line);
+            r.highlight_spans.clearRetainingCapacity();
+            if (!is_note) {
+                highlight.highlightLine(lang, r.logical_line_buf.items, &r.highlight_spans, r.allocator) catch {};
+            }
+        }
+
+        const line_box = BoundingBox{
+            .x = content.x,
+            .y = y,
+            .w = content.w,
+            .h = ch,
+        };
+        if (is_note) {
+            drawTextLineClipped(r, vp, line.bytes, line_box, text_note, null, 0, null, null);
+        } else {
+            var bctx: ?BracketDrawCtx = null;
+            if (bidx) |bi| {
+                var line_abs: u32 = 0;
+                if (doc_for_lines) |d| {
+                    const abs_line = frag_start_line + line.logical_line;
+                    if (abs_line < d.lineCount()) {
+                        line_abs = d.lineStartOffset(abs_line);
+                    }
+                }
+                bctx = .{
+                    .index = bi,
+                    .line_abs_start = line_abs,
+                    .active_open = active_open,
+                    .active_close = active_close,
+                };
+            }
+            // GlowRays-style: bloom each glyph in its syntax color, then crisp text on top.
+            if (glow_cols) |gc| {
+                drawTextGlyphBloom(
+                    r,
+                    vp,
+                    line.bytes,
+                    line_box,
+                    r.highlight_spans.items,
+                    line.col_offset,
+                    gc[0],
+                    gc[1],
+                );
+            }
+            drawTextLineClipped(r, vp, line.bytes, line_box, text_body, r.highlight_spans.items, line.col_offset, bctx, if (glow_cols) |gc|
+                GlyphRangeForce{ .col0 = gc[0], .col1 = gc[1], .brighten = true }
+            else
+                null);
+        }
+        y += ch;
+    }
+}
+
+/// Force / brighten glyphs in columns [col0, col1) within a display segment.
+const GlyphRangeForce = struct {
+    col0: u32,
+    col1: u32,
+    /// When true, boost syntax color (GlowRays core); else replace with fixed color.
+    brighten: bool = false,
+    color: Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+};
+
+/// Soften a syntax color slightly toward white for the glowing core.
+fn neonBrighten(c: Color) Color {
+    // Hot core like GlowRays: push toward white without washing out the hue.
+    return .{
+        .r = @min(1.0, c.r * 1.18 + 0.14),
+        .g = @min(1.0, c.g * 1.18 + 0.14),
+        .b = @min(1.0, c.b * 1.15 + 0.12),
+        .a = 1.0,
+    };
+}
+
+fn syntaxColorAt(spans: []const highlight.Span, span_base: u32, col: u32, default: Color) Color {
+    const kind = highlight.kindAt(spans, span_base + col);
+    const rgb = highlight.colorRgb(kind);
+    _ = default;
+    return Color.rgb(rgb.r, rgb.g, rgb.b);
+}
+
+/// GlowRays-style text bloom under crisp glyphs.
+///
+/// Three passes for a smooth, accurate neon look:
+/// 1) Soft elliptical discs (smooth atmospheric haze, no hard edges)
+/// 2) Multi-direction offset glyph samples (shape-following soft blur)
+/// 3) Slightly enlarged soft glyph copies (tight letter bloom)
+fn drawTextGlyphBloom(
+    r: *Renderer,
+    vp: Viewport,
+    bytes: []const u8,
+    box: BoundingBox,
+    spans: []const highlight.Span,
+    span_base: u32,
+    col0: u32,
+    col1: u32,
+) void {
+    if (bytes.len == 0 or box.w < 1 or col1 <= col0) return;
+
+    const cw = Font.charW();
+    const ch = Font.charH();
+
+    // --- Pass 1: smooth radial haze (untextured discs) ---
+    sgl.loadPipeline(r.pip_blend);
+    var x = box.x;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        if (x + cw > box.x + box.w + 0.5) break;
+        const c = bytes[i];
+        if (c == '\t') {
+            x += cw * 4;
+            continue;
+        }
+        if (c < 32) {
+            x += cw;
+            continue;
+        }
+        const col: u32 = @intCast(i);
+        if (col >= col0 and col < col1 and c > ' ') {
+            const base = syntaxColorAt(spans, span_base, col, text_body);
+            const cx = x + cw * 0.5;
+            const cy = box.y + ch * 0.5;
+            // Slightly wider than tall — matches typical glyph mass.
+            fillSoftEllipseWorld(vp, cx, cy, cw * 1.55, ch * 1.25, base, 0.20);
+        }
+        x += cw;
+    }
+
+    // --- Pass 2+3: textured soft glyph samples ---
+    sgl.enableTexture();
+    sgl.texture(r.atlas_view, r.atlas_smp);
+    sgl.beginQuads();
+
+    // Multi-direction offsets approximate a gaussian blur of the letter shape.
+    // Radii in fractions of the cell size.
+    const radii = [_]f32{ 0.22, 0.40, 0.62, 0.88, 1.18 };
+    const rad_alpha = [_]f32{ 0.14, 0.11, 0.08, 0.055, 0.035 };
+    const n_dir: u32 = 12;
+    const two_pi: f32 = std.math.pi * 2.0;
+
+    var ri: usize = 0;
+    while (ri < radii.len) : (ri += 1) {
+        const rad = radii[ri];
+        const a = rad_alpha[ri];
+        x = box.x;
+        i = 0;
+        while (i < bytes.len) : (i += 1) {
+            if (x + cw > box.x + box.w + 0.5) break;
+            const c = bytes[i];
+            if (c == '\t') {
+                x += cw * 4;
+                continue;
+            }
+            if (c < 32) {
+                x += cw;
+                continue;
+            }
+            const col: u32 = @intCast(i);
+            if (col >= col0 and col < col1 and c > ' ') {
+                const base = syntaxColorAt(spans, span_base, col, text_body);
+                const col_c = Color.rgba(base.r, base.g, base.b, a);
+                var d: u32 = 0;
+                while (d < n_dir) : (d += 1) {
+                    const ang = two_pi * @as(f32, @floatFromInt(d)) / @as(f32, @floatFromInt(n_dir));
+                    // Add half-step rotation per ring so samples interleave (smoother).
+                    const ang2 = ang + (if (ri % 2 == 1) two_pi / @as(f32, @floatFromInt(n_dir * 2)) else 0);
+                    const ox = @cos(ang2) * rad * cw;
+                    const oy = @sin(ang2) * rad * ch * 0.85;
+                    emitGlyphScaled(vp, x + ox, box.y + oy, c, col_c, 1.04);
+                }
+            }
+            x += cw;
+        }
+    }
+
+    // Tight letter bloom: a few gentle enlargements (low alpha so edges stay soft).
+    const tight_scales = [_]f32{ 1.55, 1.32, 1.16 };
+    const tight_alpha = [_]f32{ 0.10, 0.14, 0.18 };
+    var si: usize = 0;
+    while (si < tight_scales.len) : (si += 1) {
+        const scale = tight_scales[si];
+        const a = tight_alpha[si];
+        x = box.x;
+        i = 0;
+        while (i < bytes.len) : (i += 1) {
+            if (x + cw > box.x + box.w + 0.5) break;
+            const c = bytes[i];
+            if (c == '\t') {
+                x += cw * 4;
+                continue;
+            }
+            if (c < 32) {
+                x += cw;
+                continue;
+            }
+            const col: u32 = @intCast(i);
+            if (col >= col0 and col < col1 and c > ' ') {
+                const base = syntaxColorAt(spans, span_base, col, text_body);
+                emitGlyphScaled(vp, x, box.y, c, Color.rgba(base.r, base.g, base.b, a), scale);
+            }
+            x += cw;
+        }
+    }
+
+    sgl.end();
+    sgl.disableTexture();
+    sgl.loadDefaultPipeline();
+}
+
+/// Soft filled ellipse via concentric triangle-fans (smooth radial falloff).
+fn fillSoftEllipseWorld(
+    vp: Viewport,
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    tint: Color,
+    peak_alpha: f32,
+) void {
+    const sc = vp.worldToScreen(.{ .x = cx, .y = cy });
+    const s = vp.pixelScale();
+    const rx_px = rx * s;
+    const ry_px = ry * s;
+    if (rx_px < 1 or ry_px < 1) return;
+
+    const rings: u32 = 8;
+    const segs: u32 = 16;
+    var ring: i32 = @intCast(rings);
+    while (ring >= 1) : (ring -= 1) {
+        const t = @as(f32, @floatFromInt(ring)) / @as(f32, @floatFromInt(rings));
+        // Smooth cubic falloff — outer haze very soft, core a bit stronger.
+        const fall = 1.0 - t;
+        const a = peak_alpha * fall * fall * fall;
+        const rxi = rx_px * t;
+        const ryi = ry_px * t;
+        const col = Color.rgba(tint.r, tint.g, tint.b, a);
+        sgl.beginTriangles();
+        var s_i: u32 = 0;
+        while (s_i < segs) : (s_i += 1) {
+            const a0 = std.math.pi * 2.0 * @as(f32, @floatFromInt(s_i)) / @as(f32, @floatFromInt(segs));
+            const a1 = std.math.pi * 2.0 * @as(f32, @floatFromInt(s_i + 1)) / @as(f32, @floatFromInt(segs));
+            sgl.v2fC4f(sc.x, sc.y, col.r, col.g, col.b, col.a);
+            sgl.v2fC4f(sc.x + @cos(a0) * rxi, sc.y + @sin(a0) * ryi, col.r, col.g, col.b, col.a);
+            sgl.v2fC4f(sc.x + @cos(a1) * rxi, sc.y + @sin(a1) * ryi, col.r, col.g, col.b, col.a);
+        }
+        sgl.end();
+    }
+}
+
+fn paintSelection(
+    vp: Viewport,
+    content: BoundingBox,
+    sel: bubble_mod.Selection,
+    cw: f32,
+    ch: f32,
+) void {
+    const n = sel.normalized();
+    var line = n.sl;
+    while (line <= n.el) : (line += 1) {
+        const y = content.y + @as(f32, @floatFromInt(line)) * ch;
+        if (y + ch < content.y or y > content.bottom()) continue;
+        const start_col: u32 = if (line == n.sl) n.sc else 0;
+        // Full line remainder unless last selected line.
+        const end_col: u32 = if (line == n.el) n.ec else 4096;
+        if (end_col <= start_col and line == n.el and line == n.sl) continue;
+        const x0 = content.x + @as(f32, @floatFromInt(start_col)) * cw;
+        const x1 = if (line == n.el)
+            content.x + @as(f32, @floatFromInt(end_col)) * cw
+        else
+            content.x + content.w;
+        const w = @max(0, @min(x1, content.right()) - @max(x0, content.x));
+        if (w < 1) continue;
+        fillWorldRect(vp, .{
+            .x = @max(x0, content.x),
+            .y = y,
+            .w = w,
+            .h = ch,
+        }, selection_bg);
+    }
+}
+
+const active_bracket_bg = Color.rgba(1.0, 1.0, 1.0, 0.14);
+
+/// Highlight cells of active open/close brackets inside this bubble's content area.
+/// Note: uses unwrapped line columns (good enough when caret pair is on-screen).
+fn paintActiveBracketBg(
+    vp: Viewport,
+    content: BoundingBox,
+    doc: *const doc_mod.Document,
+    frag_start_line: u32,
+    frag_source: []const u8,
+    active_open: ?u32,
+    active_close: ?u32,
+    cw: f32,
+    ch: f32,
+) void {
+    _ = frag_source;
+    if (active_open) |o| paintOneActiveBracket(vp, content, doc, frag_start_line, o, cw, ch);
+    if (active_close) |c| paintOneActiveBracket(vp, content, doc, frag_start_line, c, cw, ch);
+}
+
+fn paintOneActiveBracket(
+    vp: Viewport,
+    content: BoundingBox,
+    doc: *const doc_mod.Document,
+    frag_start_line: u32,
+    off: u32,
+    cw: f32,
+    ch: f32,
+) void {
+    const lc = doc.lineColAt(off);
+    if (lc.line < frag_start_line) return;
+    const local_line = lc.line - frag_start_line;
+    const y = content.y + @as(f32, @floatFromInt(local_line)) * ch;
+    if (y + ch < content.y or y > content.bottom()) return;
+    const x = content.x + @as(f32, @floatFromInt(lc.col)) * cw;
+    if (x + cw < content.x or x > content.right()) return;
+    fillWorldRect(vp, .{ .x = x, .y = y, .w = cw, .h = ch }, active_bracket_bg);
+}
+
+fn fillLogicalLine(r: *Renderer, source: []const u8, logical_idx: u32) void {
+    r.logical_line_buf.clearRetainingCapacity();
+    var idx: u32 = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= source.len) : (i += 1) {
+        const at_end = i == source.len;
+        const at_nl = !at_end and source[i] == '\n';
+        if (!at_end and !at_nl) continue;
+        if (idx == logical_idx) {
+            r.logical_line_buf.appendSlice(r.allocator, source[start..i]) catch {};
+            return;
+        }
+        if (at_end) return;
+        start = i + 1;
+        idx += 1;
+    }
+}
+
+fn drawCaret(r: *Renderer, vp: Viewport, store: *const DocumentStore, b: *const bubble_mod.Bubble) void {
+    // Steady caret — no blink. Position must match drawCodeContent reflow rows
+    // (logical line × charH is wrong once any line soft-wraps).
+    const content = b.contentBounds();
+    if (content.w < 1 or content.h < 1) return;
+
+    const source = b.displayText(store);
+    const line: u32 = b.caret.line;
+    var col: u32 = b.caret.col;
+
+    // Glyph under caret from the same buffer the user edits (local or note/doc).
+    var under: u8 = ' ';
+    const row_bytes = bubble_mod.lineSliceOf(source, line);
+    if (col > row_bytes.len) col = @intCast(row_bytes.len);
+    if (col < row_bytes.len) {
+        const ch_byte = row_bytes[col];
+        if (ch_byte >= 32 and ch_byte < 127) under = ch_byte;
+    }
+
+    const max_cols = text_mod.maxColsForWidth(content.w);
+    r.reflow_lines.clearRetainingCapacity();
+    _ = text_mod.reflow(r.allocator, source, max_cols, &r.reflow_lines) catch {
+        // Fallback: unwrapped (pre-reflow) layout.
+        const ch = Font.charH();
+        const cw = Font.charW();
+        const x = content.x + @as(f32, @floatFromInt(col)) * cw;
+        const y = content.y + @as(f32, @floatFromInt(line)) * ch;
+        paintCaretBlock(r, vp, x, y, cw, ch, under);
+        return;
+    };
+
+    // Find the display row that contains (logical_line, col).
+    var disp_row: ?usize = null;
+    var col_in_row: u32 = col;
+    for (r.reflow_lines.items, 0..) |dl, i| {
+        if (dl.logical_line != line) continue;
+        const row_len: u32 = @intCast(dl.bytes.len);
+        const start = dl.col_offset;
+        const end = start + row_len;
+        // Caret may sit past end of last wrap piece (EOL).
+        if (col >= start and (col < end or (col == end and (i + 1 >= r.reflow_lines.items.len or r.reflow_lines.items[i + 1].logical_line != line)))) {
+            disp_row = i;
+            col_in_row = col - start;
+            break;
+        }
+        // Prefer last piece of this logical line if col is past all wraps.
+        if (col >= end) {
+            disp_row = i;
+            col_in_row = row_len;
+        }
+    }
+    if (disp_row == null and r.reflow_lines.items.len > 0) {
+        // Logical line beyond reflow (should not happen after clamp) → last row.
+        disp_row = r.reflow_lines.items.len - 1;
+        col_in_row = @intCast(r.reflow_lines.items[disp_row.?].bytes.len);
+    }
+    const row_i = disp_row orelse return;
+
+    const ch = Font.charH();
+    const cw = Font.charW();
+    var x = content.x + @as(f32, @floatFromInt(col_in_row)) * cw;
+    var y = content.y + @as(f32, @floatFromInt(row_i)) * ch;
+    // Fully inside content — never paint caret on the bubble chrome / outside the body.
+    if (y + ch > content.bottom() + 0.5) {
+        // Clamp to last visible row when the bubble is shorter than reflow (should be rare).
+        const max_rows: f32 = @floor(content.h / ch);
+        if (max_rows < 1) return;
+        y = content.y + (max_rows - 1.0) * ch;
+    }
+    if (y < content.y) return;
+    if (x < content.x) x = content.x;
+    if (x + cw > content.right() + 0.5) {
+        x = @max(content.x, content.right() - cw);
+    }
+
+    paintCaretBlock(r, vp, x, y, cw, ch, under);
+}
+
+fn paintCaretBlock(r: *Renderer, vp: Viewport, x: f32, y: f32, cw: f32, ch: f32, under: u8) void {
+    fillWorldRect(vp, .{ .x = x, .y = y, .w = cw, .h = ch }, caret_block);
+    if (under == ' ') return;
+    sgl.loadPipeline(r.pip_blend);
+    sgl.enableTexture();
+    sgl.texture(r.atlas_view, r.atlas_smp);
+    sgl.beginQuads();
+    emitGlyph(vp, x, y, under, caret_glyph);
+    sgl.end();
+    sgl.disableTexture();
+    sgl.loadDefaultPipeline();
+}
+
+/// Draw a monospaced line. If `spans` is non-null, color by highlight kinds.
+/// `span_base` is the byte offset of `bytes` within the full logical line.
+/// `bracket_ctx` overrides colors for nested bracket pairs (BPC2-style).
+/// `force_range` forces a solid color for a column range (e.g. link name pill).
+fn drawTextLineClipped(
+    r: *Renderer,
+    vp: Viewport,
+    bytes: []const u8,
+    box: BoundingBox,
+    default_color: Color,
+    spans: ?[]const highlight.Span,
+    span_base: u32,
+    bracket_ctx: ?BracketDrawCtx,
+    force_range: ?GlyphRangeForce,
+) void {
+    if (bytes.len == 0 or box.w < 1) return;
+
+    sgl.loadPipeline(r.pip_blend);
+    sgl.enableTexture();
+    sgl.texture(r.atlas_view, r.atlas_smp);
+    sgl.beginQuads();
+
+    const cw = Font.charW();
+    var x = box.x;
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 1) {
+        if (x + cw > box.x + box.w + 0.5) break;
+        const c = bytes[i];
+        if (c >= 0x80) {
+            if (c >= 0xC0) {
+                emitGlyph(vp, x, box.y, '?', default_color);
+                x += cw;
+            }
+            continue;
+        }
+        if (c == '\t') {
+            x += cw * 4;
+            continue;
+        }
+        if (c == '\r') continue;
+
+        var color = default_color;
+        if (spans) |sp| {
+            const kind = highlight.kindAt(sp, span_base + @as(u32, @intCast(i)));
+            const rgb = highlight.colorRgb(kind);
+            color = Color.rgb(rgb.r, rgb.g, rgb.b);
+        }
+        // Rainbow brackets override punctuation coloring.
+        if (bracket_ctx) |bc| {
+            const abs_off = bc.line_abs_start + span_base + @as(u32, @intCast(i));
+            if (bc.index.entryAt(abs_off)) |ent| {
+                if (ent.unmatched and !ent.is_open) {
+                    color = Color.rgb(brackets_mod.unmatched_color.r, brackets_mod.unmatched_color.g, brackets_mod.unmatched_color.b);
+                } else {
+                    const rgb = brackets_mod.rgbForDepth(ent.depth);
+                    color = Color.rgb(rgb.r, rgb.g, rgb.b);
+                }
+                const is_active = (bc.active_open != null and bc.active_open.? == abs_off) or
+                    (bc.active_close != null and bc.active_close.? == abs_off);
+                if (is_active) {
+                    const br = brackets_mod.brighten(color.r, color.g, color.b);
+                    color = Color.rgb(br.r, br.g, br.b);
+                }
+            }
+        }
+        // Link glow: brighten core glyphs (bloom already drawn underneath).
+        if (force_range) |fr| {
+            const col: u32 = @intCast(i);
+            if (col >= fr.col0 and col < fr.col1) {
+                if (fr.brighten) {
+                    color = neonBrighten(color);
+                } else {
+                    color = fr.color;
+                }
+            }
+        }
+        emitGlyph(vp, x, box.y, c, color);
+        x += cw;
+    }
+
+    sgl.end();
+    sgl.disableTexture();
+    sgl.loadDefaultPipeline();
+}
+
+fn emitGlyph(vp: Viewport, world_x: f32, world_y: f32, codepoint: u8, color: Color) void {
+    emitGlyphScaled(vp, world_x, world_y, codepoint, color, 1.0);
+}
+
+/// Draw a glyph optionally scaled about the cell center (for soft neon bloom layers).
+fn emitGlyphScaled(vp: Viewport, world_x: f32, world_y: f32, codepoint: u8, color: Color, scale: f32) void {
+    const uv = Font.glyphUv(codepoint);
+    const cw = Font.charW();
+    const ch = Font.charH();
+    const cx = world_x + cw * 0.5;
+    const cy = world_y + ch * 0.5;
+    const sc = vp.worldToScreen(.{ .x = cx, .y = cy });
+    const sw = cw * scale * vp.pixelScale();
+    const sh = ch * scale * vp.pixelScale();
+    // Soft layers: no pixel snap (avoids shimmering halos). Core (scale≈1) snaps.
+    const snap = scale < 1.05;
+    const x0 = if (snap) @floor(sc.x - sw * 0.5 + 0.5) else sc.x - sw * 0.5;
+    const y0 = if (snap) @floor(sc.y - sh * 0.5 + 0.5) else sc.y - sh * 0.5;
+    const w = if (snap) @max(@as(f32, 1), @round(sw)) else @max(@as(f32, 1), sw);
+    const h = if (snap) @max(@as(f32, 1), @round(sh)) else @max(@as(f32, 1), sh);
+    const x1 = x0 + w;
+    const y1 = y0 + h;
+    sgl.v2fT2fC4f(x0, y0, uv.u_min, uv.v_min, color.r, color.g, color.b, color.a);
+    sgl.v2fT2fC4f(x1, y0, uv.u_max, uv.v_min, color.r, color.g, color.b, color.a);
+    sgl.v2fT2fC4f(x1, y1, uv.u_max, uv.v_max, color.r, color.g, color.b, color.a);
+    sgl.v2fT2fC4f(x0, y1, uv.u_min, uv.v_max, color.r, color.g, color.b, color.a);
+}
+
+fn fillWorldRect(vp: Viewport, box: BoundingBox, c: Color) void {
+    const tl = vp.worldToScreen(.{ .x = box.x, .y = box.y });
+    const br = vp.worldToScreen(.{ .x = box.right(), .y = box.bottom() });
+    fillScreenRect(tl.x, tl.y, br.x, br.y, c);
+}
+
+fn strokeWorldRect(vp: Viewport, box: BoundingBox, c: Color, thickness_px: f32) void {
+    const tl = vp.worldToScreen(.{ .x = box.x, .y = box.y });
+    const br = vp.worldToScreen(.{ .x = box.right(), .y = box.bottom() });
+    strokeScreenRect(tl.x, tl.y, br.x, br.y, c, thickness_px);
+}
+
+fn fillWorldRoundRect(vp: Viewport, box: BoundingBox, r_world: f32, c: Color) void {
+    const tl = vp.worldToScreen(.{ .x = box.x, .y = box.y });
+    const br = vp.worldToScreen(.{ .x = box.right(), .y = box.bottom() });
+    const r_px = r_world * vp.pixelScale();
+    fillScreenRoundRect(tl.x, tl.y, br.x, br.y, r_px, c);
+}
+
+/// Rounded top corners only (title bar that matches the bubble chrome).
+fn fillWorldRoundTopRect(vp: Viewport, box: BoundingBox, r_world: f32, c: Color) void {
+    const tl = vp.worldToScreen(.{ .x = box.x, .y = box.y });
+    const br = vp.worldToScreen(.{ .x = box.right(), .y = box.bottom() });
+    const r_px = r_world * vp.pixelScale();
+    fillScreenRoundTopRect(tl.x, tl.y, br.x, br.y, r_px, c);
+}
+
+fn strokeWorldRoundRect(vp: Viewport, box: BoundingBox, r_world: f32, c: Color, thickness_px: f32) void {
+    const tl = vp.worldToScreen(.{ .x = box.x, .y = box.y });
+    const br = vp.worldToScreen(.{ .x = box.right(), .y = box.bottom() });
+    const r_px = r_world * vp.pixelScale();
+    strokeScreenRoundRect(tl.x, tl.y, br.x, br.y, r_px, c, thickness_px);
+}
+
+fn fillScreenRect(x0: f32, y0: f32, x1: f32, y1: f32, c: Color) void {
+    sgl.beginQuads();
+    sgl.v2fC4f(x0, y0, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(x1, y0, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(x1, y1, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(x0, y1, c.r, c.g, c.b, c.a);
+    sgl.end();
+}
+
+/// Axis-aligned border as four thin quads (crisp at any zoom).
+fn strokeScreenRect(x0: f32, y0: f32, x1: f32, y1: f32, c: Color, t: f32) void {
+    fillScreenRect(x0, y0, x1, y0 + t, c);
+    fillScreenRect(x0, y1 - t, x1, y1, c);
+    fillScreenRect(x0, y0, x0 + t, y1, c);
+    fillScreenRect(x1 - t, y0, x1, y1, c);
+}
+
+fn clampCornerRadius(x0: f32, y0: f32, x1: f32, y1: f32, r: f32) f32 {
+    const w = @abs(x1 - x0);
+    const h = @abs(y1 - y0);
+    const half = @min(w, h) * 0.5;
+    if (half < 1.0) return 0;
+    return std.math.clamp(r, 0, half);
+}
+
+/// Filled axis-aligned rounded rect in screen space (y-down).
+fn fillScreenRoundRect(x0: f32, y0: f32, x1: f32, y1: f32, r_in: f32, c: Color) void {
+    const r = clampCornerRadius(x0, y0, x1, y1, r_in);
+    if (r < 0.5) {
+        fillScreenRect(x0, y0, x1, y1, c);
+        return;
+    }
+    // Center + 4 side boxes.
+    fillScreenRect(x0 + r, y0, x1 - r, y1, c);
+    fillScreenRect(x0, y0 + r, x0 + r, y1 - r, c);
+    fillScreenRect(x1 - r, y0 + r, x1, y1 - r, c);
+    // Corners: TL, TR, BR, BL (screen y-down: TL is min x,y).
+    fillScreenCorner(x0 + r, y0 + r, r, std.math.pi, std.math.pi * 1.5, c); // TL
+    fillScreenCorner(x1 - r, y0 + r, r, std.math.pi * 1.5, std.math.pi * 2.0, c); // TR
+    fillScreenCorner(x1 - r, y1 - r, r, 0, std.math.pi * 0.5, c); // BR
+    fillScreenCorner(x0 + r, y1 - r, r, std.math.pi * 0.5, std.math.pi, c); // BL
+}
+
+/// Rounded on the top edge only (title strip).
+fn fillScreenRoundTopRect(x0: f32, y0: f32, x1: f32, y1: f32, r_in: f32, c: Color) void {
+    const r = clampCornerRadius(x0, y0, x1, y1, r_in);
+    if (r < 0.5) {
+        fillScreenRect(x0, y0, x1, y1, c);
+        return;
+    }
+    // Body of strip (includes square bottom).
+    fillScreenRect(x0 + r, y0, x1 - r, y1, c);
+    fillScreenRect(x0, y0 + r, x0 + r, y1, c);
+    fillScreenRect(x1 - r, y0 + r, x1, y1, c);
+    fillScreenCorner(x0 + r, y0 + r, r, std.math.pi, std.math.pi * 1.5, c); // TL
+    fillScreenCorner(x1 - r, y0 + r, r, std.math.pi * 1.5, std.math.pi * 2.0, c); // TR
+}
+
+/// Quarter-disk as triangle fan from center (angles in radians, screen y-down).
+/// Standard math angles: 0 = +x, π/2 = +y (down on screen).
+fn fillScreenCorner(cx: f32, cy: f32, r: f32, a0: f32, a1: f32, c: Color) void {
+    const n = corner_segments;
+    sgl.beginTriangles();
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const t0 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n));
+        const t1 = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(n));
+        const ang0 = a0 + (a1 - a0) * t0;
+        const ang1 = a0 + (a1 - a0) * t1;
+        const x_a = cx + @cos(ang0) * r;
+        const y_a = cy + @sin(ang0) * r;
+        const x_b = cx + @cos(ang1) * r;
+        const y_b = cy + @sin(ang1) * r;
+        sgl.v2fC4f(cx, cy, c.r, c.g, c.b, c.a);
+        sgl.v2fC4f(x_a, y_a, c.r, c.g, c.b, c.a);
+        sgl.v2fC4f(x_b, y_b, c.r, c.g, c.b, c.a);
+    }
+    sgl.end();
+}
+
+/// Rounded rect stroke via thick polyline along the perimeter.
+fn strokeScreenRoundRect(x0: f32, y0: f32, x1: f32, y1: f32, r_in: f32, c: Color, t: f32) void {
+    const r = clampCornerRadius(x0, y0, x1, y1, r_in);
+    if (r < 0.5) {
+        strokeScreenRect(x0, y0, x1, y1, c, t);
+        return;
+    }
+    const half = t * 0.5;
+    // Straight edges (inset by r so corners own the arcs).
+    strokeThickSeg(x0 + r, y0, x1 - r, y0, half, c); // top
+    strokeThickSeg(x1, y0 + r, x1, y1 - r, half, c); // right
+    strokeThickSeg(x1 - r, y1, x0 + r, y1, half, c); // bottom
+    strokeThickSeg(x0, y1 - r, x0, y0 + r, half, c); // left
+    // Corner arcs.
+    strokeScreenCornerArc(x0 + r, y0 + r, r, std.math.pi, std.math.pi * 1.5, half, c);
+    strokeScreenCornerArc(x1 - r, y0 + r, r, std.math.pi * 1.5, std.math.pi * 2.0, half, c);
+    strokeScreenCornerArc(x1 - r, y1 - r, r, 0, std.math.pi * 0.5, half, c);
+    strokeScreenCornerArc(x0 + r, y1 - r, r, std.math.pi * 0.5, std.math.pi, half, c);
+}
+
+fn strokeThickSeg(ax: f32, ay: f32, bx: f32, by: f32, half: f32, c: Color) void {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len = @sqrt(dx * dx + dy * dy);
+    if (len < 0.01) return;
+    const nx = -dy / len * half;
+    const ny = dx / len * half;
+    sgl.beginQuads();
+    sgl.v2fC4f(ax + nx, ay + ny, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(bx + nx, by + ny, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(bx - nx, by - ny, c.r, c.g, c.b, c.a);
+    sgl.v2fC4f(ax - nx, ay - ny, c.r, c.g, c.b, c.a);
+    sgl.end();
+}
+
+fn strokeScreenCornerArc(cx: f32, cy: f32, r: f32, a0: f32, a1: f32, half: f32, c: Color) void {
+    const n = corner_segments;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const t0 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n));
+        const t1 = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(n));
+        const ang0 = a0 + (a1 - a0) * t0;
+        const ang1 = a0 + (a1 - a0) * t1;
+        const x_a = cx + @cos(ang0) * r;
+        const y_a = cy + @sin(ang0) * r;
+        const x_b = cx + @cos(ang1) * r;
+        const y_b = cy + @sin(ang1) * r;
+        strokeThickSeg(x_a, y_a, x_b, y_b, half, c);
+    }
+}
