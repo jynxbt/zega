@@ -1,0 +1,16 @@
+.{
+    .name = .zega,
+    .version = "0.1.0",
+    .fingerprint = 0x7bd33a81304a6291,
+    .paths = .{
+        "src",
+        "build.zig",
+        "build.zig.zon",
+    },
+    .dependencies = .{
+        .sokol = .{
+            .url = "git+https://github.com/floooh/sokol-zig.git#defd351b85e55480dc60068e1dcf96da190376d1",
+            .hash = "sokol-0.1.0-pb1HK8XKNwAN8Xkkp67pjgOQ9mTdDxNBKGN4n13xw2qQ",
+        },
+    },
+}
