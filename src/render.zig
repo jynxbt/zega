@@ -18,8 +18,11 @@ const detect = @import("lang/detect.zig");
 const connection_mod = @import("connection.zig");
 const diag_mod = @import("diag.zig");
 const brackets_mod = @import("lang/brackets.zig");
+const pills = @import("pills.zig");
+const term_mod = @import("term/session.zig");
 
 pub const Canvas = canvas_mod.Canvas;
+pub const TermStore = term_mod.TermStore;
 pub const Viewport = canvas_mod.Viewport;
 pub const BoundingBox = geom.BoundingBox;
 pub const BubbleKind = bubble_mod.BubbleKind;
@@ -63,6 +66,30 @@ const bubble_fill_other = Color.rgb(0.20, 0.22, 0.20);
 /// Imports: cool teal so dependency chrome is distinct from function bodies.
 const bubble_fill_imports = Color.rgb(0.14, 0.22, 0.24);
 const bubble_border_imports = Color.rgb(0.40, 0.70, 0.72);
+/// Mini terminal: near-black shell chrome.
+const bubble_fill_terminal = Color.rgb(0.08, 0.09, 0.10);
+const bubble_border_terminal = Color.rgb(0.35, 0.55, 0.45);
+const term_selection_bg = Color.rgba(0.25, 0.45, 0.70, 0.45);
+/// Folder icon card.
+const bubble_fill_folder = Color.rgb(0.22, 0.20, 0.14);
+const bubble_border_folder = Color.rgb(0.85, 0.72, 0.35);
+const folder_tab = Color.rgb(0.90, 0.78, 0.40);
+/// Drop-target file halo highlight.
+const halo_drop_tint = Color.rgba(0.95, 0.85, 0.25, 0.28);
+const top_bar_bg = Color.rgba(0.10, 0.11, 0.13, 0.94);
+const top_bar_border = Color.rgb(0.30, 0.32, 0.36);
+const top_bar_text = Color.rgb(0.88, 0.90, 0.92);
+const top_bar_hover = Color.rgb(0.28, 0.34, 0.45);
+const top_bar_sep = Color.rgb(0.50, 0.52, 0.56);
+
+pub const top_bar_h: f32 = 34;
+/// Import pills. The mockup's orange-on-amber is pitched for a white page; on this dark canvas
+/// the pill keeps the warm hue and the bubble keeps its own fill behind it.
+const pill_fill = Color.rgb(0.84, 0.34, 0.18);
+const pill_text = Color.rgb(1.0, 0.95, 0.92);
+/// The `+` reads as an affordance, not another import — neutral rather than warm.
+const pill_plus_fill = Color.rgb(0.30, 0.34, 0.36);
+const pill_corner_r: f32 = 4;
 const bubble_border = Color.rgb(0.55, 0.58, 0.65);
 const bubble_border_active = Color.rgb(0.85, 0.90, 1.0);
 const breadcrumb_fill = Color.rgba(0.0, 0.0, 0.0, 0.25);
@@ -106,6 +133,8 @@ pub const Renderer = struct {
     highlight_spans: std.ArrayListUnmanaged(highlight.Span) = .empty,
     /// Full logical line buffer for highlighter when drawing wrap segments.
     logical_line_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// Scratch for parsed import pills (reused each frame).
+    import_pills: std.ArrayListUnmanaged(pills.Import) = .empty,
     allocator: std.mem.Allocator = undefined,
 
     pub fn init(self: *Renderer, allocator: std.mem.Allocator) void {
@@ -163,6 +192,7 @@ pub const Renderer = struct {
         self.reflow_lines.deinit(self.allocator);
         self.highlight_spans.deinit(self.allocator);
         self.logical_line_buf.deinit(self.allocator);
+        self.import_pills.deinit(self.allocator);
         // Image/view/sampler destroyed with sg.shutdown if not destroyed here.
         if (self.atlas_view.id != 0) sg.destroyView(self.atlas_view);
         if (self.atlas_smp.id != 0) sg.destroySampler(self.atlas_smp);
@@ -176,6 +206,7 @@ pub const Renderer = struct {
         store: *const DocumentStore,
         diags: *const DiagStore,
         brackets: *const BracketStore,
+        terms: ?*const TermStore,
         active_id: ?bubble_mod.BubbleId,
         focused_id: ?bubble_mod.BubbleId,
         hover_id: ?bubble_mod.BubbleId,
@@ -184,6 +215,8 @@ pub const Renderer = struct {
         menu: ?ContextMenuView,
         completion: ?CompletionPopupView,
         confirm: ?ConfirmModalView,
+        top_bar: ?TopBarView,
+        drop_doc: bubble_mod.DocId,
     ) void {
         const vp = canvas.viewport;
         const w = vp.screen_w;
@@ -198,10 +231,10 @@ pub const Renderer = struct {
         sgl.loadIdentity();
 
         drawGrid(self, vp);
-        drawHalos(self, canvas);
+        drawHalos(self, canvas, drop_doc);
         // Links under bubbles (paper 1-M rectilinear arrows).
         drawConnections(self, canvas, focused_id, hover_id, hover_amount, link_hl);
-        drawBubbles(self, canvas, store, diags, brackets, active_id, focused_id, hover_id, hover_amount, link_hl);
+        drawBubbles(self, canvas, store, diags, brackets, terms, active_id, focused_id, hover_id, hover_amount, link_hl);
         if (menu) |m| {
             if (m.open) drawContextMenu(self, vp, m);
         }
@@ -210,6 +243,9 @@ pub const Renderer = struct {
         }
         if (confirm) |cm| {
             if (cm.open) drawConfirmModal(self, vp, cm);
+        }
+        if (top_bar) |tb| {
+            if (tb.open) drawTopBar(self, vp, tb);
         }
     }
 
@@ -261,6 +297,14 @@ pub const ConfirmModalView = struct {
     message: []const u8 = "Are you sure about deleting this bubble?",
 };
 
+/// Screen-space project breadcrumb bar (top of window).
+pub const TopBarView = struct {
+    open: bool = false,
+    segment_count: u32 = 0,
+    segments: []const []const u8 = &.{},
+    hover_seg: i32 = -1,
+};
+
 pub const confirm_modal_w: f32 = 360;
 pub const confirm_modal_h: f32 = 140;
 pub const confirm_btn_w: f32 = 100;
@@ -268,6 +312,7 @@ pub const confirm_btn_h: f32 = 32;
 /// Labels for menu rows (extend as needed).
 pub const context_menu_labels = [_][]const u8{
     "Create new file",
+    "New terminal",
 };
 
 pub fn contextMenuItemCount() usize {
@@ -648,17 +693,74 @@ fn drawGrid(r: *Renderer, vp: Viewport) void {
     sgl.loadDefaultPipeline();
 }
 
-fn drawHalos(r: *Renderer, canvas: *const Canvas) void {
+fn drawHalos(r: *Renderer, canvas: *const Canvas, drop_doc: bubble_mod.DocId) void {
     if (canvas.groups.items.len == 0) return;
 
     sgl.loadPipeline(r.pip_blend);
     for (canvas.groups.items) |group| {
         const world_box = canvas.groupBounds(group.id) orelse continue;
         const padded = world_box.expanded(halo_pad);
-        const c = halo_palette[group.color_index % halo_palette.len];
+        var c = halo_palette[group.color_index % halo_palette.len];
+        if (drop_doc != bubble_mod.INVALID_DOC and group.doc == drop_doc) {
+            // Brighten drop target.
+            c = halo_drop_tint;
+        }
         fillWorldRect(canvas.viewport, padded, c);
     }
     sgl.loadDefaultPipeline();
+}
+
+fn drawTopBar(r: *Renderer, vp: Viewport, bar: TopBarView) void {
+    const scale = @max(vp.dpi, 1.0);
+    const h = top_bar_h * scale;
+    fillScreenRect(0, 0, vp.screen_w, h, top_bar_bg);
+    strokeScreenRect(0, 0, vp.screen_w, h, top_bar_border, @max(1.0, scale));
+
+    var x: f32 = 12 * scale;
+    const ty = (h - Font.charH() * scale) * 0.5;
+    const pad_x = 6 * scale;
+    const pad_y = 4 * scale;
+
+    var i: u32 = 0;
+    while (i < bar.segment_count) : (i += 1) {
+        const seg = if (i < bar.segments.len) bar.segments[i] else "";
+        const tw = @as(f32, @floatFromInt(seg.len)) * Font.charW() * scale;
+        const bx0 = x - pad_x;
+        const bx1 = x + tw + pad_x;
+        if (bar.hover_seg == @as(i32, @intCast(i))) {
+            fillScreenRect(bx0, pad_y, bx1, h - pad_y, top_bar_hover);
+        }
+        drawTextScreenFixed(r, seg, x, ty, scale, top_bar_text);
+        x = bx1 + 4 * scale;
+        if (i + 1 < bar.segment_count) {
+            drawTextScreenFixed(r, "/", x, ty, scale, top_bar_sep);
+            x += Font.charW() * scale + 4 * scale;
+        }
+    }
+}
+
+/// Hit-test breadcrumb segment under screen point. Returns segment index or null.
+pub fn topBarHit(bar: TopBarView, sx: f32, sy: f32, dpi: f32) ?usize {
+    if (!bar.open or bar.segment_count == 0) return null;
+    const scale = @max(dpi, 1.0);
+    const h = top_bar_h * scale;
+    if (sy < 0 or sy >= h) return null;
+
+    var x: f32 = 12 * scale;
+    const pad_x = 6 * scale;
+    var i: u32 = 0;
+    while (i < bar.segment_count) : (i += 1) {
+        const seg = if (i < bar.segments.len) bar.segments[i] else "";
+        const tw = @as(f32, @floatFromInt(seg.len)) * Font.charW() * scale;
+        const bx0 = x - pad_x;
+        const bx1 = x + tw + pad_x;
+        if (sx >= bx0 and sx < bx1) return i;
+        x = bx1 + 4 * scale;
+        if (i + 1 < bar.segment_count) {
+            x += Font.charW() * scale + 4 * scale;
+        }
+    }
+    return null;
 }
 
 fn drawConnections(
@@ -811,7 +913,8 @@ fn fillWorldTriangle(vp: Viewport, a: geom.Vec2, b: geom.Vec2, c: geom.Vec2, col
 }
 
 /// Peak scale when fully hovered (1.0 = no change).
-const hover_scale_max: f32 = 1.07;
+/// Hover lift. Screen-space only — `main.unscaleHover` maps clicks back through it.
+pub const hover_scale_max: f32 = 1.07;
 
 /// Per-line bracket coloring context (absolute document offsets).
 const BracketDrawCtx = struct {
@@ -828,6 +931,7 @@ fn drawBubbles(
     store: *const DocumentStore,
     diags: *const DiagStore,
     brackets: *const BracketStore,
+    terms: ?*const TermStore,
     active_id: ?bubble_mod.BubbleId,
     focused_id: ?bubble_mod.BubbleId,
     hover_id: ?bubble_mod.BubbleId,
@@ -862,7 +966,7 @@ fn drawBubbles(
                 sgl.translate(-sc.x, -sc.y, 0);
             }
 
-            drawOneBubble(r, vp, store, diags, brackets, &b, active_id, focused_id, is_hover, link_hl);
+            drawOneBubble(r, vp, store, diags, brackets, terms, &b, active_id, focused_id, is_hover, link_hl);
 
             if (scale != 1.0) {
                 sgl.matrixModeModelview();
@@ -878,6 +982,7 @@ fn drawOneBubble(
     store: *const DocumentStore,
     diags: *const DiagStore,
     brackets: *const BracketStore,
+    terms: ?*const TermStore,
     b: *const bubble_mod.Bubble,
     active_id: ?bubble_mod.BubbleId,
     focused_id: ?bubble_mod.BubbleId,
@@ -888,12 +993,14 @@ fn drawOneBubble(
         .code => bubble_fill_code,
         .note => bubble_fill_note,
         .imports => bubble_fill_imports,
+        .terminal => bubble_fill_terminal,
+        .folder => bubble_fill_folder,
         else => bubble_fill_other,
     };
     const is_active = (active_id != null and active_id.? == b.id) or
         (focused_id != null and focused_id.? == b.id);
     const on_link = link_hl != null and (link_hl.?.from_bubble == b.id or link_hl.?.to_bubble == b.id);
-    const has_errors = bubbleHasErrors(diags, b);
+    const has_errors = b.kind != .terminal and bubbleHasErrors(diags, b);
     const border = if (on_link)
         link_bubble_border
     else if (has_errors)
@@ -902,6 +1009,10 @@ fn drawOneBubble(
         bubble_border_active
     else if (b.kind == .imports)
         bubble_border_imports
+    else if (b.kind == .terminal)
+        bubble_border_terminal
+    else if (b.kind == .folder)
+        bubble_border_folder
     else
         bubble_border;
     // Linked bubbles: clear but not a thick yellow frame that fights the code.
@@ -923,7 +1034,26 @@ fn drawOneBubble(
 
     strokeWorldRoundRect(vp, b.bounds, bubble_corner_r, border, border_w);
 
-    if (b.title.len != 0 and crumb_h > 4) {
+    // Folder tab accent (simple folder silhouette).
+    if (b.kind == .folder) {
+        const tab = BoundingBox{
+            .x = b.bounds.x + 10,
+            .y = b.bounds.y + crumb_h * 0.35,
+            .w = 28,
+            .h = 10,
+        };
+        fillWorldRoundRect(vp, tab, 3, folder_tab);
+        const body = BoundingBox{
+            .x = b.bounds.x + 8,
+            .y = b.bounds.y + crumb_h * 0.35 + 8,
+            .w = b.bounds.w - 16,
+            .h = b.bounds.h - crumb_h * 0.35 - 16,
+        };
+        fillWorldRoundRect(vp, body, 4, folder_tab);
+    }
+
+    // Terminal titles come from the live session (drawn in the terminal body path).
+    if (b.kind != .terminal and b.title.len != 0 and crumb_h > 4) {
         var title_buf: [320]u8 = undefined;
         var title_slice: []const u8 = b.title;
         // Per-bubble dirty star (not whole-document — many bubbles share one file).
@@ -947,24 +1077,207 @@ fn drawOneBubble(
         drawCloseButton(vp, b.closeButtonBounds(), is_hover or is_active);
     }
 
-    const body = b.displayText(store);
-    if (body.len != 0 or b.kind == .code) {
-        const content = b.contentBounds();
-        var lang: detect.Language = .unknown;
-        if (b.fragment()) |f| {
-            if (store.getConst(f.doc)) |d| lang = d.lang;
+    const is_focused = focused_id != null and focused_id.? == b.id;
+
+    if (b.kind == .terminal) {
+        if (terms) |ts| {
+            if (b.term_id != bubble_mod.INVALID_TERM) {
+                if (ts.findConst(b.term_id)) |sess| {
+                    // Prefer live session title (e.g. exited suffix).
+                    if (sess.title.len != 0 and crumb_h > 4) {
+                        const close_reserve = bubble_mod.Bubble.close_btn_size + bubble_mod.Bubble.close_btn_pad * 2;
+                        const title_box = BoundingBox{
+                            .x = b.bounds.x + b.pad_x,
+                            .y = b.bounds.y + 3,
+                            .w = @max(0, b.bounds.w - b.pad_x * 2 - close_reserve),
+                            .h = crumb_h - 4,
+                        };
+                        // Overwrite the static bubble title with session title.
+                        drawTextLineClipped(r, vp, sess.title, title_box, text_title, null, 0, null, null);
+                    }
+                    drawTerminalContent(r, vp, b, sess, is_focused);
+                }
+            }
         }
-        const is_focused = focused_id != null and focused_id.? == b.id;
-        drawCodeContent(r, vp, store, brackets, body, content, lang, b.kind == .note, b, link_hl, is_focused);
+    } else {
+        const body = b.displayText(store);
+        if (body.len != 0 or b.kind == .code) {
+            const content = b.contentBounds();
+            var lang: detect.Language = .unknown;
+            if (b.fragment()) |f| {
+                if (store.getConst(f.doc)) |d| lang = d.lang;
+            }
+            // An import block is eight lines of near-identical boilerplate; unfocused, the set of
+            // names is all a reader wants. Focus swaps back to real code so it stays editable.
+            // `drawImportPills` reports false when the block has no pills to show (Rust `use`,
+            // `usingnamespace`) — those fall through to code rather than rendering an empty box.
+            const drew_pills = b.kind == .imports and !is_focused and drawImportPills(r, vp, body, content, lang);
+            if (!drew_pills) {
+                drawCodeContent(r, vp, store, brackets, body, content, lang, b.kind == .note, b, link_hl, is_focused);
+            }
+        }
+
+        if (is_focused) {
+            drawCaret(r, vp, store, b);
+        }
+
+        if (has_errors) {
+            drawErrorBox(r, vp, diags, b);
+        }
+    }
+}
+
+/// ANSI 16-color palette for terminal cells (sRGB-ish on dark bg).
+const term_palette = [_]Color{
+    Color.rgb(0.12, 0.12, 0.12), // black
+    Color.rgb(0.80, 0.28, 0.28), // red
+    Color.rgb(0.35, 0.75, 0.40), // green
+    Color.rgb(0.85, 0.75, 0.30), // yellow
+    Color.rgb(0.35, 0.50, 0.90), // blue
+    Color.rgb(0.75, 0.40, 0.80), // magenta
+    Color.rgb(0.35, 0.78, 0.80), // cyan
+    Color.rgb(0.85, 0.87, 0.90), // white
+    Color.rgb(0.40, 0.42, 0.45), // bright black
+    Color.rgb(1.00, 0.45, 0.45), // bright red
+    Color.rgb(0.50, 0.95, 0.55), // bright green
+    Color.rgb(1.00, 0.92, 0.45), // bright yellow
+    Color.rgb(0.50, 0.70, 1.00), // bright blue
+    Color.rgb(0.95, 0.55, 1.00), // bright magenta
+    Color.rgb(0.50, 0.95, 0.95), // bright cyan
+    Color.rgb(1.00, 1.00, 1.00), // bright white
+};
+
+const term_default_fg = Color.rgb(0.85, 0.88, 0.90);
+const term_default_bg = Color.rgb(0.08, 0.09, 0.10);
+
+fn termColor(idx: term_mod.ColorIdx, is_fg: bool) Color {
+    if (idx == .default) return if (is_fg) term_default_fg else term_default_bg;
+    const i: u8 = @intFromEnum(idx);
+    if (i < term_palette.len) return term_palette[i];
+    return if (is_fg) term_default_fg else term_default_bg;
+}
+
+fn drawTerminalContent(
+    r: *Renderer,
+    vp: Viewport,
+    b: *const bubble_mod.Bubble,
+    sess: *const term_mod.Session,
+    is_focused: bool,
+) void {
+    const content = b.contentBounds();
+    if (content.w < 1 or content.h < 1) return;
+    const cw = Font.charW();
+    const ch = Font.charH();
+    const cols = sess.screen.cols;
+    const rows = sess.screen.rows;
+
+    // Pass 1: cell backgrounds + selection + cursor block (untextured).
+    var row: u16 = 0;
+    while (row < rows) : (row += 1) {
+        var col: u16 = 0;
+        while (col < cols) : (col += 1) {
+            const cell = sess.screen.viewCell(row, col);
+            const x0 = content.x + @as(f32, @floatFromInt(col)) * cw;
+            const y0 = content.y + @as(f32, @floatFromInt(row)) * ch;
+            if (x0 >= content.right() or y0 >= content.bottom()) continue;
+
+            var bg = termColor(cell.bg, false);
+            if (cell.attr.reverse) bg = termColor(cell.fg, true);
+
+            const selected = sess.selection.contains(row, col);
+            const on_cursor = is_focused and sess.screen.cursorOnView(row, col);
+
+            if (selected) {
+                fillWorldRect(vp, .{ .x = x0, .y = y0, .w = cw, .h = ch }, term_selection_bg);
+            } else if (cell.bg != .default or cell.attr.reverse) {
+                fillWorldRect(vp, .{ .x = x0, .y = y0, .w = cw, .h = ch }, bg);
+            }
+            if (on_cursor) {
+                fillWorldRect(vp, .{ .x = x0, .y = y0, .w = cw, .h = ch }, caret_block);
+            }
+        }
     }
 
-    if (focused_id != null and focused_id.? == b.id) {
-        drawCaret(r, vp, store, b);
-    }
+    // Pass 2: glyphs in one textured batch.
+    sgl.loadPipeline(r.pip_blend);
+    sgl.enableTexture();
+    sgl.texture(r.atlas_view, r.atlas_smp);
+    sgl.beginQuads();
+    row = 0;
+    while (row < rows) : (row += 1) {
+        var col: u16 = 0;
+        while (col < cols) : (col += 1) {
+            const cell = sess.screen.viewCell(row, col);
+            const x0 = content.x + @as(f32, @floatFromInt(col)) * cw;
+            const y0 = content.y + @as(f32, @floatFromInt(row)) * ch;
+            if (x0 >= content.right() or y0 >= content.bottom()) continue;
 
-    if (has_errors) {
-        drawErrorBox(r, vp, diags, b);
+            var fg = termColor(cell.fg, true);
+            var bg = termColor(cell.bg, false);
+            if (cell.attr.reverse) {
+                const tmp = fg;
+                fg = bg;
+                bg = tmp;
+            }
+            if (cell.attr.dim) {
+                fg = Color.rgb(fg.r * 0.65, fg.g * 0.65, fg.b * 0.65);
+            }
+            if (cell.attr.bold and cell.fg != .default) {
+                fg = Color.rgb(@min(fg.r * 1.1, 1), @min(fg.g * 1.1, 1), @min(fg.b * 1.1, 1));
+            }
+
+            const on_cursor = is_focused and sess.screen.cursorOnView(row, col);
+            const ch_byte: u8 = if (cell.ch >= 32 and cell.ch < 127) cell.ch else if (cell.ch != 0) '?' else ' ';
+            if (ch_byte != ' ' or on_cursor) {
+                const glyph_col = if (on_cursor) caret_glyph else fg;
+                emitGlyph(vp, x0, y0, if (ch_byte == ' ' and on_cursor) ' ' else ch_byte, glyph_col);
+            }
+        }
     }
+    sgl.end();
+    sgl.disableTexture();
+    sgl.loadDefaultPipeline();
+}
+
+/// An import block drawn as a wrapped grid of name pills, plus a `+` control.
+///
+/// Walks the same `pills.Walker` sequence the height and the hit-test walk. Nothing about the
+/// layout is stored, so the three cannot drift — the walker is the single source.
+///
+/// Returns false when there is nothing to draw, so the caller can fall back to code rather
+/// than leaving an empty box.
+fn drawImportPills(
+    r: *Renderer,
+    vp: Viewport,
+    source: []const u8,
+    content: BoundingBox,
+    lang: detect.Language,
+) bool {
+    if (content.w < 1 or content.h < 1) return false;
+    pills.parse(r.allocator, source, lang, &r.import_pills) catch return false;
+    if (!pills.hasPills(r.import_pills.items)) return false;
+
+    var w = pills.Walker.init(content);
+    for (r.import_pills.items) |imp| {
+        const box = w.next(imp.name.len);
+        if (box.bottom() > content.bottom() + 0.5) return true; // ran past the bubble; drop the rest
+        drawPill(r, vp, box, imp.name, pill_fill);
+    }
+    const p = w.plus();
+    if (p.bottom() <= content.bottom() + 0.5) drawPill(r, vp, p, "+", pill_plus_fill);
+    return true;
+}
+
+fn drawPill(r: *Renderer, vp: Viewport, box: BoundingBox, label: []const u8, fill: Color) void {
+    fillWorldRoundRect(vp, box, pill_corner_r, fill);
+    // Centre the label: pills are sized from it, but `+` sits in a square.
+    const text_w = @as(f32, @floatFromInt(label.len)) * Font.charW();
+    drawTextLineClipped(r, vp, label, .{
+        .x = box.x + @max(pills.pill_pad_x, (box.w - text_w) * 0.5),
+        .y = box.y + pills.pill_pad_y,
+        .w = box.w - pills.pill_pad_x,
+        .h = box.h - pills.pill_pad_y * 2,
+    }, pill_text, null, 0, null, null);
 }
 
 fn bubbleHasErrors(diags: *const DiagStore, b: *const bubble_mod.Bubble) bool {

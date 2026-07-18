@@ -6,6 +6,7 @@ pub const canvas = @import("canvas.zig");
 pub const spacer = @import("spacer.zig");
 pub const font = @import("font.zig");
 pub const text = @import("text.zig");
+pub const pills = @import("pills.zig");
 pub const doc = @import("doc.zig");
 pub const detect = @import("lang/detect.zig");
 pub const outline = @import("lang/outline.zig");
@@ -16,6 +17,10 @@ pub const edit = @import("edit.zig");
 pub const layout = @import("layout.zig");
 pub const connection = @import("connection.zig");
 pub const diag = @import("diag.zig");
+pub const term_screen = @import("term/screen.zig");
+pub const term_vt = @import("term/vt.zig");
+pub const project = @import("project.zig");
+// session/pty need fork — tested via app; screen+vt are pure unit tests.
 
 pub const Vec2 = geom.Vec2;
 pub const BoundingBox = geom.BoundingBox;
@@ -35,6 +40,7 @@ test {
     _ = spacer;
     _ = font;
     _ = text;
+    _ = pills;
     _ = doc;
     _ = detect;
     _ = outline;
@@ -47,4 +53,7 @@ test {
     _ = layout;
     _ = connection;
     _ = diag;
+    _ = term_screen;
+    _ = term_vt;
+    _ = project;
 }

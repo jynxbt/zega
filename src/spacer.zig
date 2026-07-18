@@ -184,92 +184,48 @@ fn resolveFrom(state: *SpacerState, fixed_id: BubbleId, depth: u32) !void {
     }
 }
 
-/// After free-form moves, recompute implicit working sets by proximity.
-/// Two bubbles join a group if their expanded bounds (by `proximity`) touch
-/// or if they share a connected component through other near neighbors.
-/// Paper §6.3: "Groups automatically form when bubbles are brought close enough."
+/// File-halos: one group per document for fragment bubbles on the canvas.
+/// Single-member files still get a halo (drop target + visual file region).
+/// Terminals / folders / notes are ungrouped.
+///
+/// (Proximity working-sets from the paper are deferred; default chrome is file identity.)
 pub fn recomputeWorkingSets(canvas: *Canvas) !void {
-    const n = canvas.bubbles.items.len;
-    if (n == 0) return;
+    try recomputeFileGroups(canvas);
+}
 
-    // Union-find over bubble indices.
-    const parent = try canvas.allocator.alloc(usize, n);
-    defer canvas.allocator.free(parent);
-    const rank = try canvas.allocator.alloc(u8, n);
-    defer canvas.allocator.free(rank);
-    for (parent, 0..) |*p, i| p.* = i;
-    @memset(rank, 0);
-
-    const find = struct {
-        fn go(p: []usize, i: usize) usize {
-            var x = i;
-            while (p[x] != x) {
-                p[x] = p[p[x]];
-                x = p[x];
-            }
-            return x;
-        }
-    }.go;
-
-    const unite = struct {
-        fn go(p: []usize, r: []u8, a: usize, b: usize) void {
-            var ra = find(p, a);
-            var rb = find(p, b);
-            if (ra == rb) return;
-            if (r[ra] < r[rb]) std.mem.swap(usize, &ra, &rb);
-            p[rb] = ra;
-            if (r[ra] == r[rb]) r[ra] += 1;
-        }
-    }.go;
-
-    const prox = canvas.group_proximity;
-    for (0..n) |i| {
-        const bi = canvas.bubbles.items[i].bounds.expanded(prox * 0.5);
-        for (i + 1..n) |j| {
-            const bj = canvas.bubbles.items[j].bounds.expanded(prox * 0.5);
-            if (bi.intersects(bj)) unite(parent, rank, i, j);
-        }
-    }
-
+pub fn recomputeFileGroups(canvas: *Canvas) !void {
     // Tear down old groups.
     for (canvas.groups.items) |*g| g.deinit(canvas.allocator);
     canvas.groups.clearRetainingCapacity();
     for (canvas.bubbles.items) |*b| b.group_id = INVALID_GROUP;
 
-    // Build new groups for components with 2+ members.
-    var root_to_group: std.AutoHashMapUnmanaged(usize, GroupId) = .empty;
-    defer root_to_group.deinit(canvas.allocator);
+    // doc_id → group index in canvas.groups
+    var doc_to_gidx: std.AutoHashMapUnmanaged(bubble_mod.DocId, usize) = .empty;
+    defer doc_to_gidx.deinit(canvas.allocator);
 
     var color: u8 = 0;
-    for (0..n) |i| {
-        const root = find(parent, i);
-        // Count members of this component.
-        var count: usize = 0;
-        for (0..n) |k| {
-            if (find(parent, k) == root) count += 1;
-        }
-        if (count < 2) continue;
-
-        const gop = try root_to_group.getOrPut(canvas.allocator, root);
+    for (canvas.bubbles.items) |*b| {
+        // Only document-backed code/import bubbles form file groups.
+        if (b.kind != .code and b.kind != .imports) continue;
+        const f = b.fragment() orelse continue;
+        const gop = try doc_to_gidx.getOrPut(canvas.allocator, f.doc);
         if (!gop.found_existing) {
             const gid = canvas.next_group_id;
             canvas.next_group_id += 1;
+            // Stable-ish color from doc id.
+            const cidx: u8 = @truncate(f.doc +% color);
+            color +%= 1;
             try canvas.groups.append(canvas.allocator, .{
                 .id = gid,
-                .color_index = color,
+                .color_index = cidx,
+                .doc = f.doc,
             });
-            color +%= 1;
-            gop.value_ptr.* = gid;
+            gop.value_ptr.* = canvas.groups.items.len - 1;
         }
-        const gid = gop.value_ptr.*;
-        canvas.bubbles.items[i].group_id = gid;
-        // Attach member list on the WorkingSet.
-        for (canvas.groups.items) |*g| {
-            if (g.id == gid) {
-                try g.members.append(canvas.allocator, canvas.bubbles.items[i].id);
-                break;
-            }
-        }
+        const gidx = gop.value_ptr.*;
+        const g = &canvas.groups.items[gidx];
+        b.group_id = g.id;
+        try g.members.append(canvas.allocator, b.id);
     }
 }
 
@@ -344,19 +300,22 @@ test "resolveOverlaps separates free pairs and respects pin" {
         .intersects(bb.bounds.expanded(canvas.gap * 0.5 - 0.1)));
 }
 
-test "working sets form by proximity" {
+test "file groups form by document id" {
     const alloc = std.testing.allocator;
 
     var canvas = Canvas.init(alloc);
     defer canvas.deinit();
-    canvas.group_proximity = 20;
 
-    _ = try canvas.addBubble(.code, .{ .x = 0, .y = 0, .w = 40, .h = 40 });
-    _ = try canvas.addBubble(.code, .{ .x = 50, .y = 0, .w = 40, .h = 40 }); // near first
-    _ = try canvas.addBubble(.code, .{ .x = 500, .y = 500, .w = 40, .h = 40 }); // isolated
+    const a = try canvas.addBubble(.code, .{ .x = 0, .y = 0, .w = 40, .h = 40 });
+    const b = try canvas.addBubble(.code, .{ .x = 50, .y = 0, .w = 40, .h = 40 });
+    const c = try canvas.addBubble(.code, .{ .x = 500, .y = 500, .w = 40, .h = 40 });
+    canvas.findBubble(a).?.setFragment(1, 0, 5);
+    canvas.findBubble(b).?.setFragment(1, 5, 10); // same file
+    canvas.findBubble(c).?.setFragment(2, 0, 3); // other file
 
-    try recomputeWorkingSets(&canvas);
-    try std.testing.expect(canvas.groups.items.len == 1);
-    try std.testing.expect(canvas.groups.items[0].members.items.len == 2);
-    try std.testing.expect(canvas.bubbles.items[2].group_id == INVALID_GROUP);
+    try recomputeFileGroups(&canvas);
+    try std.testing.expect(canvas.groups.items.len == 2);
+    // Both doc1 bubbles share a group.
+    try std.testing.expect(canvas.bubbles.items[0].group_id == canvas.bubbles.items[1].group_id);
+    try std.testing.expect(canvas.bubbles.items[0].group_id != canvas.bubbles.items[2].group_id);
 }

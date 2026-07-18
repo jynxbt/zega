@@ -10,10 +10,13 @@ pub const BubbleId = u32;
 pub const GroupId = u32;
 pub const ConnectionId = u32;
 pub const DocId = doc_mod.DocId;
+/// Terminal session id (owned by TermStore when kind == .terminal).
+pub const TermId = u32;
 
 pub const INVALID_BUBBLE: BubbleId = std.math.maxInt(BubbleId);
 pub const INVALID_GROUP: GroupId = std.math.maxInt(GroupId);
 pub const INVALID_DOC = doc_mod.INVALID_DOC;
+pub const INVALID_TERM: TermId = std.math.maxInt(TermId);
 
 /// Kind of content hosted by a bubble (paper §5–6).
 pub const BubbleKind = enum {
@@ -25,6 +28,10 @@ pub const BubbleKind = enum {
     flag,
     /// Module imports / use statements (compact dependency bubble).
     imports,
+    /// Interactive mini terminal (PTY / zsh). See `src/term/`.
+    terminal,
+    /// Project subfolder icon (navigate-in-place).
+    folder,
 };
 
 /// Document-backed fragment range (half-open lines).
@@ -125,6 +132,8 @@ pub const WorkingSet = struct {
     name: []const u8 = "",
     color_index: u8 = 0,
     members: std.ArrayListUnmanaged(BubbleId) = .empty,
+    /// When this group is a **file halo**, the document all members belong to.
+    doc: DocId = INVALID_DOC,
 
     pub fn deinit(self: *WorkingSet, allocator: std.mem.Allocator) void {
         self.members.deinit(allocator);
@@ -173,6 +182,9 @@ pub const Bubble = struct {
     pinned: bool = false,
     z: u32 = 0,
 
+    /// When `kind == .terminal`, id of the session in TermStore.
+    term_id: TermId = INVALID_TERM,
+
     pub fn deinit(self: *Bubble, allocator: std.mem.Allocator) void {
         if (self.text.len != 0) allocator.free(self.text);
         if (self.local_text) |lt| allocator.free(lt);
@@ -214,7 +226,10 @@ pub const Bubble = struct {
             .start_line = start_line,
             .end_line = end_line,
         } };
-        self.kind = .code;
+        // Promote a note to code, but never overwrite a kind the caller chose on purpose.
+        // Unconditionally forcing `.code` here silently un-did `addBubble(.imports, …)`, so
+        // import bubbles have been rendering as ordinary code all along.
+        if (self.kind == .note) self.kind = .code;
     }
 
     pub fn setTitleOwned(self: *Bubble, allocator: std.mem.Allocator, title: []const u8) !void {
@@ -455,4 +470,20 @@ test "fragment range shift" {
     f.shift(15, -1);
     try std.testing.expectEqual(@as(u32, 12), f.start_line);
     try std.testing.expectEqual(@as(u32, 21), f.end_line);
+}
+
+test "setFragment keeps a deliberately chosen kind" {
+    // Regression: `setFragment` used to force `.code` unconditionally, silently undoing
+    // `addBubble(.imports, …)` — so import bubbles rendered as ordinary code and
+    // `bubble_fill_imports` was never reachable.
+    var b = Bubble{ .id = 1, .kind = .imports, .bounds = .{ .x = 0, .y = 0, .w = 100, .h = 50 } };
+    b.setFragment(7, 0, 3);
+    try std.testing.expect(b.kind == .imports);
+    try std.testing.expect(b.fragment() != null);
+}
+
+test "setFragment promotes a note to code" {
+    var b = Bubble{ .id = 1, .kind = .note, .bounds = .{ .x = 0, .y = 0, .w = 100, .h = 50 } };
+    b.setFragment(7, 0, 3);
+    try std.testing.expect(b.kind == .code);
 }

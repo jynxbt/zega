@@ -50,6 +50,11 @@ pub const Editor = struct {
         stack.clearRetainingCapacity();
     }
 
+    fn clearStacks(self: *Editor) void {
+        clearStack(&self.undo_stack, self.allocator);
+        clearStack(&self.redo_stack, self.allocator);
+    }
+
     fn pushUndo(self: *Editor, entry: UndoEntry) !void {
         clearStack(&self.redo_stack, self.allocator);
         try self.undo_stack.append(self.allocator, entry);
@@ -1033,6 +1038,112 @@ pub fn wordRightCol(line: []const u8, col: u32) u32 {
         while (c < len and isWordChar(line[c])) : (c += 1) {}
     }
     return @intCast(c);
+}
+
+/// Physically move a fragment bubble from its source document into `target_doc`
+/// (append at end of target). Updates both documents and rebinds the bubble.
+/// Caller's responsibility to recompute file groups / spacer afterward.
+pub fn moveFragmentToDoc(
+    ed: *Editor,
+    store: *DocumentStore,
+    canvas: *Canvas,
+    bubble_id: BubbleId,
+    target_doc_id: doc_mod.DocId,
+) !void {
+    const b = canvas.findBubble(bubble_id) orelse return error.UnknownBubble;
+    if (b.kind != .code and b.kind != .imports) return error.NotMovable;
+    const f = b.fragment() orelse return error.NotAFragment;
+    if (f.doc == target_doc_id) return; // already there
+
+    const src = store.get(f.doc) orelse return error.UnknownDocument;
+    const dst = store.get(target_doc_id) orelse return error.UnknownDocument;
+
+    // Text to move: prefer detached local, else document range.
+    const moved_owned: []u8 = blk: {
+        if (b.local_text) |lt| {
+            break :blk try ed.allocator.dupe(u8, lt);
+        }
+        const slice = src.rangeSlice(f.start_line, f.end_line);
+        break :blk try ed.allocator.dupe(u8, slice);
+    };
+    defer ed.allocator.free(moved_owned);
+
+    if (moved_owned.len == 0) return error.EmptyFragment;
+
+    // Ensure trailing newline so we don't glue onto the next write.
+    var payload = moved_owned;
+    var payload_owned: ?[]u8 = null;
+    defer if (payload_owned) |p| ed.allocator.free(p);
+    if (payload[payload.len - 1] != '\n') {
+        const buf = try ed.allocator.alloc(u8, payload.len + 1);
+        @memcpy(buf[0..payload.len], payload);
+        buf[payload.len] = '\n';
+        payload_owned = buf;
+        payload = buf;
+    }
+
+    // Delete from source document (use base range if detached).
+    const del_start = if (b.local_text != null) b.local_base_start else f.start_line;
+    const del_end = if (b.local_text != null) b.local_base_end else f.end_line;
+    const start_off: u32 = if (del_start < src.lineCount())
+        src.lineStartOffset(del_start)
+    else
+        @intCast(src.bytes.items.len);
+    const end_off: u32 = if (del_end < src.lineCount())
+        src.lineStartOffset(del_end)
+    else
+        @intCast(src.bytes.items.len);
+    if (end_off > start_off) {
+        try src.bytes.replaceRange(ed.allocator, start_off, end_off - start_off, &.{});
+        try src.rebuildLineIndex(ed.allocator);
+        src.dirty = true;
+    }
+    const removed_lines: i32 = -@as(i32, @intCast(del_end -% del_start));
+    if (removed_lines != 0) {
+        bubble_mod.shiftAllFragmentsExcept(
+            canvas.bubbles.items,
+            f.doc,
+            del_end,
+            removed_lines,
+            b.id,
+        );
+    }
+
+    // Append to target.
+    if (dst.bytes.items.len > 0 and dst.bytes.items[dst.bytes.items.len - 1] != '\n') {
+        try dst.bytes.append(ed.allocator, '\n');
+    }
+    // After rebuild, prefer append at end of bytes.
+    const before_len = dst.bytes.items.len;
+    try dst.bytes.appendSlice(ed.allocator, payload);
+    try dst.rebuildLineIndex(ed.allocator);
+    dst.dirty = true;
+
+    // Compute new line range in target for the bubble.
+    const new_start = blk: {
+        if (before_len == 0) break :blk @as(u32, 0);
+        const lc = dst.lineColAt(@intCast(before_len));
+        break :blk if (lc.col == 0) lc.line else lc.line;
+    };
+    const new_end = dst.lineCount();
+
+    // Rebind bubble.
+    b.clearLocal(ed.allocator);
+    b.setFragment(target_doc_id, new_start, if (new_end > new_start) new_end else new_start + 1);
+    b.dirty = true;
+    b.caret = .{};
+    b.selection.clear();
+
+    // Update title basename.
+    const base = std.fs.path.basename(dst.path);
+    // Keep symbol part before " - " if present.
+    var title_buf: [320]u8 = undefined;
+    const sym = if (std.mem.indexOf(u8, b.title, " - ")) |i| b.title[0..i] else b.title;
+    const new_title = std.fmt.bufPrint(&title_buf, "{s} - {s}", .{ sym, base }) catch b.title;
+    b.setTitleOwned(ed.allocator, new_title) catch {};
+
+    // Clear undo stacks — multi-doc undo not supported for moves.
+    ed.clearStacks();
 }
 
 fn insertIntoNote(allocator: std.mem.Allocator, b: *Bubble, text: []const u8) !void {

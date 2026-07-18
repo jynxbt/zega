@@ -9,89 +9,134 @@ const outline_mod = @import("lang/outline.zig");
 const detect = @import("lang/detect.zig");
 const font_mod = @import("font.zig");
 const text_mod = @import("text.zig");
+const pills = @import("pills.zig");
 const spacer = @import("spacer.zig");
+const term_mod = @import("term/session.zig");
+const project_mod = @import("project.zig");
 
 pub const DocumentStore = doc_mod.DocumentStore;
 pub const Canvas = canvas_mod.Canvas;
+pub const TermStore = term_mod.TermStore;
 
 pub const OpenLimits = struct {
-    max_files: u32 = 20,
-    max_bubbles: u32 = 100,
-    max_depth: u32 = 6,
+    max_files: u32 = 40,
+    max_bubbles: u32 = 200,
+    max_folders: u32 = 40,
 };
 
 /// Layout constants (world units).
 const origin_x: f32 = 40;
-const origin_y: f32 = 40;
+const origin_y: f32 = 56; // leave a little room under the top bar in world framing
 const gap_x: f32 = 28;
 const gap_y: f32 = 24;
+/// Gap between file clusters so file-halos stay visually separate.
+const file_cluster_gap_x: f32 = 64;
+const folder_col_w: f32 = 140;
+const folder_card_w: f32 = 120;
+const folder_card_h: f32 = 72;
 /// Wide enough for typical Zig signatures without harsh mid-expression wraps.
 const bubble_w: f32 = 440;
-const row_wrap_w: f32 = 1600;
 const min_bubble_h: f32 = 72;
 /// Soft cap — prefer fitting content; only clamp pathological giants.
 const max_bubble_h: f32 = 1400;
 
-pub fn openPath(
+/// Open only the immediate children of `dir_abs` (no recursive walk).
+/// Folders → folder-icon bubbles; supported source files → outline bubbles in per-file clusters.
+pub fn openFolderLevel(
     store: *DocumentStore,
     canvas: *Canvas,
-    path: []const u8,
+    dir_abs: []const u8,
     limits: OpenLimits,
-    bubble_count: *u32,
 ) !void {
     const io = store.io;
-    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => |e| return e,
-    };
-    if (st.kind == .directory) {
-        try walkDir(store, canvas, path, limits, 0, bubble_count);
-    } else {
-        try openFile(store, canvas, path, limits, bubble_count);
-    }
-}
-
-fn walkDir(
-    store: *DocumentStore,
-    canvas: *Canvas,
-    path: []const u8,
-    limits: OpenLimits,
-    depth: u32,
-    bubble_count: *u32,
-) !void {
-    if (depth > limits.max_depth) return;
-    if (bubble_count.* >= limits.max_bubbles) return;
-
-    const io = store.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_abs, .{ .iterate = true });
     defer dir.close(io);
 
+    var folder_names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (folder_names.items) |n| store.allocator.free(n);
+        folder_names.deinit(store.allocator);
+    }
+    var file_names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (file_names.items) |n| store.allocator.free(n);
+        file_names.deinit(store.allocator);
+    }
+
     var it = dir.iterate();
-    var files_opened: u32 = 0;
     while (try it.next(io)) |entry| {
-        if (bubble_count.* >= limits.max_bubbles) break;
+        if (project_mod.shouldSkipDirName(entry.name) and entry.kind == .directory) continue;
         if (entry.name.len > 0 and entry.name[0] == '.') continue;
-        if (std.mem.eql(u8, entry.name, "zig-cache") or
-            std.mem.eql(u8, entry.name, "zig-out") or
-            std.mem.eql(u8, entry.name, "target") or
-            std.mem.eql(u8, entry.name, "node_modules") or
-            std.mem.eql(u8, entry.name, ".zig-cache"))
-            continue;
-
-        var sub_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const sub = try std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ path, entry.name });
-
         switch (entry.kind) {
-            .directory => try walkDir(store, canvas, sub, limits, depth + 1, bubble_count),
+            .directory => {
+                if (project_mod.shouldSkipDirName(entry.name)) continue;
+                if (folder_names.items.len >= limits.max_folders) continue;
+                try folder_names.append(store.allocator, try store.allocator.dupe(u8, entry.name));
+            },
             .file => {
                 if (!detect.isSupported(entry.name)) continue;
-                if (files_opened >= limits.max_files) continue;
-                try openFile(store, canvas, sub, limits, bubble_count);
-                files_opened += 1;
+                if (file_names.items.len >= limits.max_files) continue;
+                try file_names.append(store.allocator, try store.allocator.dupe(u8, entry.name));
             },
             else => {},
         }
     }
+
+    // Stable order for deterministic layout.
+    std.mem.sort([]u8, folder_names.items, {}, struct {
+        fn less(_: void, a: []u8, b: []u8) bool {
+            return std.ascii.lessThanIgnoreCase(a, b);
+        }
+    }.less);
+    std.mem.sort([]u8, file_names.items, {}, struct {
+        fn less(_: void, a: []u8, b: []u8) bool {
+            return std.ascii.lessThanIgnoreCase(a, b);
+        }
+    }.less);
+
+    var bubble_count: u32 = 0;
+
+    // Folder icons: left column.
+    var folder_y = origin_y;
+    for (folder_names.items) |name| {
+        if (bubble_count >= limits.max_bubbles) break;
+        try placeFolderBubble(canvas, name, origin_x, folder_y);
+        folder_y += folder_card_h + gap_y;
+        bubble_count += 1;
+    }
+
+    // Files: clusters to the right of the folder column.
+    const files_origin_x = origin_x + if (folder_names.items.len > 0) folder_col_w + gap_x else 0;
+    var file_x = files_origin_x;
+
+    for (file_names.items) |name| {
+        if (bubble_count >= limits.max_bubbles) break;
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_abs, name });
+        const before = canvas.bubbles.items.len;
+        try openFileAt(store, canvas, path, limits, &bubble_count, file_x, origin_y);
+        // Advance cluster x by width of this file's bubbles + gap.
+        var cluster_right = file_x;
+        for (canvas.bubbles.items[before..]) |b| {
+            cluster_right = @max(cluster_right, b.bounds.right());
+        }
+        file_x = cluster_right + file_cluster_gap_x;
+    }
+}
+
+fn placeFolderBubble(canvas: *Canvas, name: []const u8, x: f32, y: f32) !void {
+    const id = try canvas.addBubble(.folder, .{
+        .x = x,
+        .y = y,
+        .w = folder_card_w,
+        .h = folder_card_h,
+    });
+    const b = canvas.findBubble(id).?;
+    b.pad_x = 8;
+    b.pad_y = 22;
+    try b.setTitleOwned(canvas.allocator, name);
+    // Store folder name for navigation (relative child name).
+    try b.setFragmentKeyOwned(canvas.allocator, name);
 }
 
 pub fn openFile(
@@ -100,6 +145,18 @@ pub fn openFile(
     path: []const u8,
     limits: OpenLimits,
     bubble_count: *u32,
+) !void {
+    try openFileAt(store, canvas, path, limits, bubble_count, origin_x, origin_y);
+}
+
+fn openFileAt(
+    store: *DocumentStore,
+    canvas: *Canvas,
+    path: []const u8,
+    limits: OpenLimits,
+    bubble_count: *u32,
+    cluster_x: f32,
+    cluster_y: f32,
 ) !void {
     if (bubble_count.* >= limits.max_bubbles) return;
     if (!detect.isSupported(path)) return;
@@ -113,6 +170,7 @@ pub fn openFile(
 
     const base = std.fs.path.basename(path);
     const start_count = bubble_count.*;
+    var local_y = cluster_y;
 
     // Outline items only (imports, functions, types). No whole-file preview bubble.
     for (items.items) |item| {
@@ -120,7 +178,8 @@ pub fn openFile(
         // Skip outline item that is already the whole file.
         if (item.start_line == 0 and item.end_line >= doc.lineCount() and std.mem.eql(u8, item.name, base))
             continue;
-        try placeBubble(store, canvas, doc_id, base, item, bubble_count);
+        const h = try placeBubble(store, canvas, doc_id, base, item, bubble_count, cluster_x, local_y);
+        local_y += h + gap_y;
     }
 
     // Paper 1-M: wire call edges from fragment text (name().
@@ -227,6 +286,67 @@ fn findCall(body: []const u8, name: []const u8) ?CallSite {
     return null;
 }
 
+// --- imports bubble: pills when unfocused, code when focused ---
+
+fn bubbleLang(store: *const DocumentStore, b: *const bubble_mod.Bubble) detect.Language {
+    const f = b.fragment() orelse return .unknown;
+    const d = store.getConst(f.doc) orelse return .unknown;
+    return d.lang;
+}
+
+/// Imports stay compact so they read as chrome rather than a method.
+/// `min_bubble_h` (72) already exceeds the old 56 floor and 220 is far below `max_bubble_h`,
+/// so this is the whole range — chaining the general clamp first would just be noise.
+fn clampImportsHeight(h: f32) f32 {
+    return std.math.clamp(h, min_bubble_h, imports_max_h);
+}
+
+/// Cap on an imports bubble. Focused blocks longer than ~11 lines clip against this: there is
+/// no scrolling, and `drawCodeContent` simply stops at the content edge.
+const imports_max_h: f32 = 220;
+
+/// Height an import block needs to show its pills — from `pills.layoutHeight`, the same walker
+/// the renderer draws with. Sizing from anything else lets the bubble clip pills it drew.
+///
+/// Null when the block has no pills (Rust `use`, `usingnamespace`): the renderer falls back to
+/// code for those, so the height must too, or the bubble is sized for a view it never draws.
+fn pillsHeightFor(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    lang: detect.Language,
+    w: f32,
+    pad_x: f32,
+    pad_y: f32,
+) ?f32 {
+    var list: std.ArrayListUnmanaged(pills.Import) = .empty;
+    defer list.deinit(allocator);
+    pills.parse(allocator, source, lang, &list) catch return null;
+    if (!pills.hasPills(list.items)) return null;
+    // The walker only reads x/w for wrapping; height is its output, not its input.
+    const content = geom.BoundingBox{ .x = 0, .y = 0, .w = @max(0, w - pad_x * 2), .h = 0 };
+    return pad_y + pills.layoutHeight(list.items, content) + pad_x;
+}
+
+/// Height the same block needs as editable code.
+fn codeHeightFor(source: []const u8, w: f32, pad_x: f32, pad_y: f32) f32 {
+    const max_cols = text_mod.maxColsForWidth(@max(0, w - pad_x * 2));
+    const n = text_mod.reflowCount(source, max_cols);
+    return pad_y + pad_x + @as(f32, @floatFromInt(n + 1)) * font_mod.Font.charH();
+}
+
+/// Height for an imports bubble in whatever view it is currently showing.
+///
+/// Pills are shorter than the code they replace, so focusing has to grow the bubble — otherwise
+/// the code it just switched to is clipped.
+pub fn importsHeight(store: *DocumentStore, b: *const bubble_mod.Bubble) f32 {
+    const src = b.displayText(store);
+    const code_h = codeHeightFor(src, b.bounds.w, b.pad_x, b.pad_y);
+    if (b.focused) return clampImportsHeight(code_h);
+    const pill_h = pillsHeightFor(store.allocator, src, bubbleLang(store, b), b.bounds.w, b.pad_x, b.pad_y);
+    return clampImportsHeight(pill_h orelse code_h);
+}
+
+/// Place one outline bubble at (x, y). Returns its height for vertical stacking.
 fn placeBubble(
     store: *DocumentStore,
     canvas: *Canvas,
@@ -234,7 +354,9 @@ fn placeBubble(
     file_base: []const u8,
     item: outline_mod.OutlineItem,
     bubble_count: *u32,
-) !void {
+    x: f32,
+    y: f32,
+) !f32 {
     const logical_lines: u32 = if (item.end_line > item.start_line) item.end_line - item.start_line else 1;
     const lh = font_mod.Font.charH();
     const pad_x: f32 = 8;
@@ -258,19 +380,12 @@ fn placeBubble(
     var h = pad_y + pad_x + @as(f32, @floatFromInt(display_lines + 1)) * lh;
     h = std.math.clamp(h, min_bubble_h, max_bubble_h);
     if (item.kind == .import) {
-        h = std.math.clamp(h, 56, 220);
+        // Imports open unfocused, which means pills — shorter than the code they replace.
+        const body = if (store.getConst(doc_id)) |d| d.rangeSlice(item.start_line, item.end_line) else "";
+        const lang = if (store.getConst(doc_id)) |d| d.lang else .unknown;
+        // No pills (Rust `use`) → it renders as code, so size it as code.
+        h = clampImportsHeight(pillsHeightFor(store.allocator, body, lang, w, pad_x, pad_y) orelse h);
     }
-
-    // Pack left-to-right, wrap. Row step tracks typical bubble height, not the soft max.
-    const idx = bubble_count.*;
-    const col_w = bubble_w + gap_x;
-    const approx_cols = @max(1, @as(u32, @intFromFloat(row_wrap_w / col_w)));
-    const col = idx % approx_cols;
-    const row = idx / approx_cols;
-    const row_step = 220.0 + gap_y;
-
-    const x = origin_x + @as(f32, @floatFromInt(col)) * col_w;
-    const y = origin_y + @as(f32, @floatFromInt(row)) * row_step;
 
     const id = try canvas.addBubble(bkind, .{
         .x = x,
@@ -315,14 +430,66 @@ fn placeBubble(
     try b.setFragmentKeyOwned(store.allocator, key);
 
     bubble_count.* += 1;
+    return h;
+}
+
+/// Compact terminal bubble size from monospaced font metrics + padding.
+pub fn terminalBounds(world: geom.Vec2) geom.BoundingBox {
+    const cols: f32 = @floatFromInt(term_mod.default_cols);
+    const rows: f32 = @floatFromInt(term_mod.default_rows);
+    const cw = font_mod.Font.charW();
+    const ch = font_mod.Font.charH();
+    const pad_x: f32 = 8;
+    const pad_y: f32 = 22; // title strip
+    return .{
+        .x = world.x,
+        .y = world.y,
+        .w = pad_x * 2 + cols * cw,
+        .h = pad_y + pad_x + rows * ch,
+    };
+}
+
+/// Spawn a mini terminal (zsh PTY) bubble near `world`.
+pub fn createTerminal(
+    terms: *TermStore,
+    canvas: *Canvas,
+    world: geom.Vec2,
+) !bubble_mod.BubbleId {
+    const term_id = try terms.create();
+    errdefer terms.destroy(term_id);
+
+    const bounds = terminalBounds(world);
+    const id = try canvas.addBubble(.terminal, bounds);
+    const b = canvas.findBubble(id) orelse {
+        terms.destroy(term_id);
+        return error.UnknownBubble;
+    };
+    b.term_id = term_id;
+    b.pad_x = 8;
+    b.pad_y = 22;
+    b.line_height = font_mod.Font.charH();
+    if (terms.find(term_id)) |sess| {
+        b.setTitleOwned(canvas.allocator, sess.title) catch {
+            b.title = "zsh";
+            b.title_owned = false;
+        };
+    } else {
+        b.title = "zsh";
+    }
+
+    _ = try spacer.resolveDefault(canvas, id);
+    try spacer.recomputeWorkingSets(canvas);
+    return id;
 }
 
 /// Create a new on-disk source file near `world` and open it as bubble(s).
+/// `dir_abs` is the directory to create in (usually the current project folder).
 pub fn createNewFile(
     store: *DocumentStore,
     canvas: *Canvas,
     world: geom.Vec2,
     lang: detect.Language,
+    dir_abs: []const u8,
 ) !void {
     const ext: []const u8 = switch (lang) {
         .rust => ".rs",
@@ -345,8 +512,10 @@ pub fn createNewFile(
         ,
     };
 
-    var path_buf: [128]u8 = undefined;
-    const path = try uniqueUntitledPath(store, &path_buf, ext);
+    var name_buf: [64]u8 = undefined;
+    const name = try uniqueUntitledName(store, &name_buf, ext, dir_abs);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_abs, name });
 
     // Write file to disk.
     {
@@ -357,23 +526,18 @@ pub fn createNewFile(
 
     const before = canvas.bubbles.items.len;
     var count: u32 = @intCast(before);
-    try openFile(store, canvas, path, .{}, &count);
+    try openFileAt(store, canvas, path, .{}, &count, world.x, world.y);
 
-    // Move newly added bubbles near the click position.
+    // Move newly added bubbles near the click position (openFileAt already uses world).
     if (canvas.bubbles.items.len > before) {
         const first = &canvas.bubbles.items[before];
-        const dx = world.x - first.bounds.x;
-        const dy = world.y - first.bounds.y;
-        for (canvas.bubbles.items[before..]) |*b| {
-            b.translate(.{ .x = dx, .y = dy });
-        }
         // Settle overlaps from the first new bubble.
         _ = try spacer.resolveDefault(canvas, first.id);
         try spacer.recomputeWorkingSets(canvas);
     }
 }
 
-fn uniqueUntitledPath(store: *DocumentStore, buf: []u8, ext: []const u8) ![]const u8 {
+fn uniqueUntitledName(store: *DocumentStore, buf: []u8, ext: []const u8, dir_abs: []const u8) ![]const u8 {
     // Prefer untitled.zig, then untitled-2.zig, ...
     var n: u32 = 0;
     while (n < 1000) : (n += 1) {
@@ -392,7 +556,9 @@ fn uniqueUntitledPath(store: *DocumentStore, buf: []u8, ext: []const u8) ![]cons
         }
         if (taken) continue;
 
-        const st = std.Io.Dir.cwd().statFile(store.io, name, .{}) catch |err| switch (err) {
+        var full: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&full, "{s}/{s}", .{ dir_abs, name }) catch continue;
+        const st = std.Io.Dir.cwd().statFile(store.io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return name,
             else => continue,
         };
@@ -426,32 +592,13 @@ pub fn finalizeLayout(canvas: *Canvas) !void {
     }
 }
 
-/// Load default samples when no CLI paths given.
-pub fn openDefaults(store: *DocumentStore, canvas: *Canvas) !void {
-    var count: u32 = 0;
-
-    // Canonical project-root paths (testdata/…), NOT src/testdata/.
-    // Users/tools often watch testdata/calls.zig — saves used to hit src/testdata/
-    // and looked like "Cmd+S does nothing". Embed is only the seed if missing.
-    // openOrCreate stores an absolute path so Cmd+S always hits the same file.
-    {
-        const zig_src = @embedFile("testdata/calls.zig");
-        const id = try store.openOrCreate("testdata/calls.zig", zig_src);
-        try openScratchDoc(store, canvas, id, &count);
-    }
-    {
-        const zig_src = @embedFile("testdata/sample.zig");
-        const id = try store.openOrCreate("testdata/sample.zig", zig_src);
-        try openScratchDoc(store, canvas, id, &count);
-    }
-    try finalizeLayout(canvas);
-}
-
 fn openScratchDoc(
     store: *DocumentStore,
     canvas: *Canvas,
     doc_id: doc_mod.DocId,
     bubble_count: *u32,
+    cluster_x: f32,
+    cluster_y: f32,
 ) !void {
     const doc = store.get(doc_id) orelse return;
     var items: std.ArrayListUnmanaged(outline_mod.OutlineItem) = .empty;
@@ -459,12 +606,14 @@ fn openScratchDoc(
     try outline_mod.outline(store.allocator, doc.bytes.items, doc.lang, &items);
     const base = std.fs.path.basename(doc.path);
     const start_count = bubble_count.*;
+    var local_y = cluster_y;
 
     // Outline items only (imports, functions, types). No whole-file preview bubble.
     for (items.items) |item| {
         if (item.start_line == 0 and item.end_line >= doc.lineCount() and std.mem.eql(u8, item.name, base))
             continue;
-        try placeBubble(store, canvas, doc_id, base, item, bubble_count);
+        const h = try placeBubble(store, canvas, doc_id, base, item, bubble_count, cluster_x, local_y);
+        local_y += h + gap_y;
     }
     try seedCallLinks(canvas, store, start_count);
 }

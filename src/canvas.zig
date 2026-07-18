@@ -335,6 +335,41 @@ pub const Canvas = struct {
         }
         return if (found) box else null;
     }
+
+    pub fn findGroup(self: *const Canvas, group_id: GroupId) ?*const bubble_mod.WorkingSet {
+        for (self.groups.items) |*g| {
+            if (g.id == group_id) return g;
+        }
+        return null;
+    }
+
+    /// File-halo under `world` (padded like the renderer). Prefers the smallest
+    /// containing group so nested-looking clusters pick the tighter file.
+    pub fn hitTestFileGroup(self: *const Canvas, world: geom.Vec2, pad: f32) ?bubble_mod.DocId {
+        var best_doc: ?bubble_mod.DocId = null;
+        var best_area: f32 = std.math.floatMax(f32);
+        for (self.groups.items) |g| {
+            if (g.doc == bubble_mod.INVALID_DOC) continue;
+            const box = self.groupBounds(g.id) orelse continue;
+            const padded = box.expanded(pad);
+            if (!padded.containsPoint(world)) continue;
+            const area = padded.w * padded.h;
+            if (area < best_area) {
+                best_area = area;
+                best_doc = g.doc;
+            }
+        }
+        return best_doc;
+    }
+
+    /// Remove every bubble (and their connections). Documents in the store are kept.
+    pub fn clearBubbles(self: *Canvas) void {
+        for (self.bubbles.items) |*b| b.deinit(self.allocator);
+        self.bubbles.clearRetainingCapacity();
+        self.connections.clearRetainingCapacity();
+        for (self.groups.items) |*g| g.deinit(self.allocator);
+        self.groups.clearRetainingCapacity();
+    }
 };
 
 test "viewport round-trip" {

@@ -1,12 +1,14 @@
 //! zega — Code Bubbles editor for Zig & Rust.
 //!
-//! Usage:  zega [file.zig|file.rs|dir]...
-//!         zega                 # opens testdata samples
+//! Usage:  zega [project-dir]
+//!         zega                 # opens current working directory as project
 //!
 //! Controls:
 //!   Middle-drag / Alt+left-drag — pan
-//!   Right-click blank          — context menu
+//!   Right-click blank          — context menu (new file / new terminal)
 //!   Right-drag                 — pan
+//!   Click folder icon          — enter folder
+//!   Top bar breadcrumb         — navigate up
 //!   W A S D (unfocused)        — pan canvas
 //!   Scroll                     — zoom (or pan tall focused bubble)
 //!   Cmd+Scroll                 — always zoom
@@ -47,11 +49,14 @@ const render_mod = @import("render.zig");
 const doc_mod = @import("doc.zig");
 const edit_mod = @import("edit.zig");
 const layout = @import("layout.zig");
+const pills = @import("pills.zig");
 const diag_mod = @import("diag.zig");
 const brackets_mod = @import("lang/brackets.zig");
 const complete_mod = @import("lang/complete.zig");
 const font_mod = @import("font.zig");
 const text_mod = @import("text.zig");
+const term_mod = @import("term/session.zig");
+const project_mod = @import("project.zig");
 
 const Canvas = canvas_mod.Canvas;
 const BubbleId = bubble_mod.BubbleId;
@@ -61,6 +66,8 @@ const DocumentStore = doc_mod.DocumentStore;
 const Editor = edit_mod.Editor;
 const DiagStore = diag_mod.DiagStore;
 const BracketStore = brackets_mod.BracketStore;
+const TermStore = term_mod.TermStore;
+const Project = project_mod.Project;
 
 const Gpa = std.heap.DebugAllocator(.{});
 
@@ -105,9 +112,19 @@ const state = struct {
     var diags: DiagStore = undefined;
     var brackets: BracketStore = undefined;
     var editor: Editor = undefined;
+    var terms: TermStore = undefined;
+    var project: Project = undefined;
     var renderer: Renderer = .{};
     var ready: bool = false;
     var io: std.Io = undefined;
+    /// True while left-dragging a selection inside a terminal body.
+    var term_selecting: bool = false;
+    /// Doc under cursor while dragging a code bubble (file-halo drop target).
+    var drop_target_doc: doc_mod.DocId = doc_mod.INVALID_DOC;
+    var top_bar_hover: i32 = -1;
+    /// Stable breadcrumb segment views (point into project-owned strings).
+    var crumb_segs: [16][]const u8 = .{""} ** 16;
+    var crumb_count: u32 = 0;
 
     var mouse: geom.Vec2 = .{};
     var drag: DragKind = .none;
@@ -181,6 +198,16 @@ export fn init() void {
     state.diags = DiagStore.init(alloc);
     state.brackets = BracketStore.init(alloc);
     state.editor = Editor.init(alloc);
+    state.terms = TermStore.init(alloc);
+    state.project = Project.init(alloc);
+    // Fixed cwd for every new mini terminal = process launch directory.
+    {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.c.getcwd(&cwd_buf, cwd_buf.len)) |_| {
+            const cwd = std.mem.sliceTo(cwd_buf[0..], 0);
+            state.terms.setLaunchCwd(cwd) catch {};
+        }
+    }
 
     // Viewport size must be known before framing the camera on open.
     syncViewportSize();
@@ -296,23 +323,88 @@ fn isSaveKey(e: *const sapp.Event) bool {
 }
 
 fn openWorkspace() !void {
-    var count: u32 = 0;
-    const limits = layout.OpenLimits{};
+    const io = state.io;
 
-    if (state.cli_paths.len > 0) {
-        for (state.cli_paths) |p| {
-            layout.openPath(&state.store, &state.canvas, p, limits, &count) catch |err| {
-                std.log.warn("open '{s}': {}", .{ p, err });
-            };
+    // Resolve project root: 0 args → cwd; 1 arg → must be directory; else error.
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_abs: []const u8 = blk: {
+        if (state.cli_paths.len == 0) {
+            if (std.c.getcwd(&root_buf, root_buf.len)) |_| {
+                break :blk std.mem.sliceTo(root_buf[0..], 0);
+            }
+            return error.NoCwd;
         }
-        try layout.finalizeLayout(&state.canvas);
-    } else {
-        try layout.openDefaults(&state.store, &state.canvas);
+        if (state.cli_paths.len > 1) {
+            std.log.err("zega expects a single project directory (got {d} paths)", .{state.cli_paths.len});
+            return error.TooManyArgs;
+        }
+        const p = state.cli_paths[0];
+        const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch |err| {
+            std.log.err("cannot open '{s}': {}", .{ p, err });
+            return err;
+        };
+        if (st.kind != .directory) {
+            std.log.err("zega expects a project directory (got file '{s}')", .{p});
+            return error.NotADirectory;
+        }
+        const n = std.Io.Dir.cwd().realPathFile(io, p, &root_buf) catch {
+            break :blk p;
+        };
+        break :blk root_buf[0..n];
+    };
+
+    try state.project.setRoot(root_abs);
+    try navigateToFolder("");
+
+    std.log.info("project root: {s}", .{state.project.root_abs});
+}
+
+/// Navigate to a relative path under the project root ("" = root). Rebuilds canvas bubbles.
+fn navigateToFolder(rel: []const u8) !void {
+    try state.project.setCwdRel(rel);
+    clearFocus();
+    state.drop_target_doc = doc_mod.INVALID_DOC;
+
+    // Free terminal sessions owned by bubbles we're about to clear.
+    for (state.canvas.bubbles.items) |b| {
+        if (b.kind == .terminal and b.term_id != bubble_mod.INVALID_TERM) {
+            state.terms.destroy(b.term_id);
+        }
     }
+    state.canvas.clearBubbles();
+
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_abs = try state.project.absCurrent(&abs_buf);
+    try layout.openFolderLevel(&state.store, &state.canvas, dir_abs, .{});
+    try layout.finalizeLayout(&state.canvas);
+    refreshAllDiags(true);
 
     if (state.canvas.bubbles.items.len > 0) {
-        focusBubble(state.canvas.bubbles.items[0].id);
+        // Prefer focusing first code bubble, else first bubble.
+        var focused = false;
+        for (state.canvas.bubbles.items) |b| {
+            if (b.kind == .code or b.kind == .imports) {
+                focusBubble(b.id);
+                focused = true;
+                break;
+            }
+        }
+        if (!focused) focusBubble(state.canvas.bubbles.items[0].id);
     }
+    refreshBreadcrumb();
+}
+
+fn refreshBreadcrumb() void {
+    state.crumb_count = @intCast(state.project.breadcrumb(&state.crumb_segs));
+}
+
+fn topBarView() render_mod.TopBarView {
+    return .{
+        .open = state.project.root_abs.len != 0,
+        .segment_count = state.crumb_count,
+        .segments = state.crumb_segs[0..state.crumb_count],
+        .hover_seg = state.top_bar_hover,
+    };
 }
 
 fn focusBubble(id: BubbleId) void {
@@ -320,13 +412,122 @@ fn focusBubble(id: BubbleId) void {
 }
 
 /// Clear keyboard/edit focus (e.g. click on blank canvas).
+/// Map a world point back to `bubble_id`'s unscaled layout.
+///
+/// `drawBubbles` lifts a hovered bubble by up to `render.hover_scale_max` about its centre —
+/// a screen-space effect only; the bounds never move. Anything hit-testing a lifted bubble's
+/// *contents* has to come back through here first, or it is comparing drawn pixels against
+/// undrawn coordinates. A pill is ~40 world wide and the lift shifts by ~10 at the edges, so
+/// skipping this reliably selects the neighbouring pill.
+fn unscaleHover(bubble_id: BubbleId, world: geom.Vec2) geom.Vec2 {
+    if (state.hovered != bubble_id or state.hover_amount <= 0.001) return world;
+    const b = state.canvas.findBubble(bubble_id) orelse return world;
+    const scale = 1.0 + (render_mod.hover_scale_max - 1.0) * std.math.clamp(state.hover_amount, 0, 1);
+    if (scale <= 1.001) return world;
+    const c = b.bounds.center();
+    return .{
+        .x = c.x + (world.x - c.x) / scale,
+        .y = c.y + (world.y - c.y) / scale,
+    };
+}
+
+/// Resize an imports bubble to match the view it is showing, and re-space only if it grew.
+///
+/// Pills are shorter than the code they replace, so focusing must grow the bubble or the code
+/// is clipped. Shrinking cannot create an overlap, so blur never needs the spacer.
+fn syncImportsHeight(bubble_id: BubbleId) void {
+    const b = state.canvas.findBubble(bubble_id) orelse return;
+    if (b.kind != .imports) return;
+
+    const old_h = b.bounds.h;
+    b.bounds.h = layout.importsHeight(&state.store, b);
+    if (b.bounds.h <= old_h + 0.5) return;
+
+    // Pin through the resolve: the spacer's global settle would otherwise drift the seed.
+    const was_pinned = b.pinned;
+    b.pinned = true;
+    _ = spacer.resolveDefault(&state.canvas, bubble_id) catch {};
+    if (state.canvas.findBubble(bubble_id)) |bb| bb.pinned = was_pinned;
+    spacer.recomputeWorkingSets(&state.canvas) catch {};
+}
+
+/// Click on an import pill or the `+`, while the bubble is showing pills.
+///
+/// Returns true when the click was consumed. Must run *before* anything focuses `id`: focus
+/// swaps the bubble to code, and the pills the user clicked would no longer be there.
+fn importPillClick(id: BubbleId, world: geom.Vec2) bool {
+    const b = state.canvas.findBubble(id) orelse return false;
+    if (b.kind != .imports or b.focused) return false; // already code — normal caret handling
+
+    const src = b.displayText(&state.store);
+    const lang = blk: {
+        const f = b.fragment() orelse break :blk pills.Language.unknown;
+        const d = state.store.getConst(f.doc) orelse break :blk pills.Language.unknown;
+        break :blk d.lang;
+    };
+
+    var list: std.ArrayListUnmanaged(pills.Import) = .empty;
+    defer list.deinit(state.gpa.allocator());
+    pills.parse(state.gpa.allocator(), src, lang, &list) catch return false;
+
+    // Same walk the renderer made, so the rects are the ones that were drawn.
+    var w = pills.Walker.init(b.contentBounds());
+    for (list.items) |imp| {
+        if (w.next(imp.name.len).containsPoint(world)) {
+            focusBubbleOpts(id, false);
+            if (state.canvas.findBubble(id)) |fb| {
+                fb.caret = .{ .line = imp.line, .col = 0 };
+                edit_mod.Editor.clampCaret(&state.store, fb);
+            }
+            syncImportsHeight(id);
+            return true;
+        }
+    }
+    if (w.plus().containsPoint(world)) {
+        addImport(id);
+        return true;
+    }
+    return false;
+}
+
+/// `+` — append a template import and drop the caret in the name slot.
+/// Goes through `Editor.insertText`, so it detaches and records undo like any other edit.
+fn addImport(id: BubbleId) void {
+    // Focus *first*: `focusBubbleOpts` clamps the caret, so any position set before it is
+    // silently overwritten. Then let `moveBubbleEnd` find the end of the body — computing it
+    // from `lineCountOf(displayText)` is off by one, because a fragment's `rangeSlice` carries
+    // the trailing newline of its last line and `clampCaret` measures against `FragmentView`.
+    // That mismatch welded the template onto the last import instead of appending a line.
+    focusBubbleOpts(id, false);
+    edit_mod.Editor.moveBubbleEnd(&state.store, &state.canvas, id);
+
+    const b = state.canvas.findBubble(id) orelse return;
+    // A trailing newline leaves the caret on an empty last line — start the import there
+    // rather than opening a second blank one.
+    const on_blank = bubble_mod.lineSliceOf(b.displayText(&state.store), b.caret.line).len == 0;
+    const template = if (on_blank) "const  = @import(\"\");" else "\nconst  = @import(\"\");";
+    state.editor.insertText(&state.store, &state.canvas, id, template) catch return;
+
+    if (state.canvas.findBubble(id)) |fb| {
+        // `insertText` already left the caret on the new line — only the column moves, so
+        // there is no line arithmetic left to get wrong.
+        fb.caret.col = "const ".len; // between `const ` and ` =`, where the name goes
+        edit_mod.Editor.clampCaret(&state.store, fb);
+    }
+    syncImportsHeight(id);
+    refreshFocusedDiags();
+}
+
 fn clearFocus() void {
     if (state.focused == bubble_mod.INVALID_BUBBLE) return;
+    const was = state.focused;
     if (state.canvas.findBubble(state.focused)) |b| {
         b.focused = false;
         b.selection.clear();
     }
     state.focused = bubble_mod.INVALID_BUBBLE;
+    // Blur returns an imports bubble to pills, which are shorter.
+    syncImportsHeight(was);
     closeCompletion();
     cancelFocusCamera();
 }
@@ -377,9 +578,46 @@ fn confirmDeleteBubble() void {
         state.drag = .none;
         state.drag_bubble = bubble_mod.INVALID_BUBBLE;
     }
+    // Kill PTY before removing the bubble.
+    if (state.canvas.findBubble(id)) |b| {
+        if (b.kind == .terminal and b.term_id != bubble_mod.INVALID_TERM) {
+            state.terms.destroy(b.term_id);
+            b.term_id = bubble_mod.INVALID_TERM;
+        }
+    }
+    state.term_selecting = false;
     state.canvas.removeBubble(id);
     // Working-set halos may change after membership drop.
     spacer.recomputeWorkingSets(&state.canvas) catch {};
+}
+
+fn focusedIsTerminal() bool {
+    if (state.focused == bubble_mod.INVALID_BUBBLE) return false;
+    const b = state.canvas.findBubble(state.focused) orelse return false;
+    return b.kind == .terminal;
+}
+
+fn focusedTermSession() ?*term_mod.Session {
+    if (state.focused == bubble_mod.INVALID_BUBBLE) return null;
+    const b = state.canvas.findBubble(state.focused) orelse return null;
+    if (b.kind != .terminal or b.term_id == bubble_mod.INVALID_TERM) return null;
+    return state.terms.find(b.term_id);
+}
+
+/// Map a world point inside a terminal bubble body to cell row/col.
+fn termCellAt(b: *const bubble_mod.Bubble, sess: *const term_mod.Session, world: geom.Vec2) struct { row: u16, col: u16 } {
+    const content = b.contentBounds();
+    const cw = font_mod.Font.charW();
+    const ch = font_mod.Font.charH();
+    var col_f = (world.x - content.x) / cw;
+    var row_f = (world.y - content.y) / ch;
+    if (col_f < 0) col_f = 0;
+    if (row_f < 0) row_f = 0;
+    var col: u16 = @intFromFloat(@floor(col_f));
+    var row: u16 = @intFromFloat(@floor(row_f));
+    if (col >= sess.screen.cols) col = sess.screen.cols -| 1;
+    if (row >= sess.screen.rows) row = sess.screen.rows -| 1;
+    return .{ .row = row, .col = col };
 }
 
 fn freeCompletionLabels() void {
@@ -545,18 +783,26 @@ fn acceptCompletion() void {
 }
 
 fn focusBubbleOpts(id: BubbleId, fly_camera: bool) void {
+    var blurred: BubbleId = bubble_mod.INVALID_BUBBLE;
     if (state.focused != bubble_mod.INVALID_BUBBLE and state.focused != id) {
         if (state.canvas.findBubble(state.focused)) |b| {
             b.focused = false;
             // Drop selection when leaving a bubble so it cannot "eat" the next edit.
             b.selection.clear();
         }
+        blurred = state.focused;
     }
     state.focused = id;
     if (state.canvas.findBubble(id)) |b| {
         b.focused = true;
         b.z = @intCast(state.canvas.bubbles.items.len);
         edit_mod.Editor.clampCaret(&state.store, b);
+    }
+    // Focusing elsewhere blurs this one, which returns an imports bubble to pills. Only
+    // `clearFocus` used to do this, so switching straight to another bubble left the old one
+    // stuck at code height, showing pills in a box sized for text.
+    if (blurred != bubble_mod.INVALID_BUBBLE) syncImportsHeight(blurred);
+    if (state.canvas.findBubble(id)) |b| {
         // Every intentional focus click re-frames (even if already focused).
         if (fly_camera) startFocusCameraOnBubble(b, null, false);
     }
@@ -959,6 +1205,17 @@ export fn frame() void {
     if (!state.ready) return;
 
     syncViewportSize();
+    // Drain PTY output before drawing so the frame shows fresh cells.
+    state.terms.pollAll();
+    // Keep bubble titles in sync with session titles (e.g. exited).
+    for (state.canvas.bubbles.items) |*b| {
+        if (b.kind != .terminal or b.term_id == bubble_mod.INVALID_TERM) continue;
+        if (state.terms.find(b.term_id)) |sess| {
+            if (!std.mem.eql(u8, b.title, sess.title)) {
+                b.setTitleOwned(state.gpa.allocator(), sess.title) catch {};
+            }
+        }
+    }
     updateFocusCamera();
     updateWasdPan();
     updateHover();
@@ -1010,11 +1267,41 @@ export fn frame() void {
         ) orelse -1;
     }
 
+    // Top bar hover.
+    if (state.project.root_abs.len != 0) {
+        state.top_bar_hover = if (render_mod.topBarHit(
+            topBarView(),
+            state.mouse.x,
+            state.mouse.y,
+            state.canvas.viewport.dpi,
+        )) |idx|
+            @intCast(idx)
+        else
+            -1;
+    }
+
+    // File-halo drop target while dragging a code bubble.
+    if (state.drag == .bubble) {
+        if (state.canvas.findBubble(state.drag_bubble)) |b| {
+            if (b.kind == .code or b.kind == .imports) {
+                const world = state.canvas.viewport.screenToWorld(state.mouse);
+                const hit = state.canvas.hitTestFileGroup(world, render_mod.halo_pad);
+                const src_doc = if (b.fragment()) |f| f.doc else doc_mod.INVALID_DOC;
+                state.drop_target_doc = if (hit) |d| (if (d != src_doc) d else doc_mod.INVALID_DOC) else doc_mod.INVALID_DOC;
+            } else {
+                state.drop_target_doc = doc_mod.INVALID_DOC;
+            }
+        }
+    } else if (state.drag != .pending_bubble) {
+        state.drop_target_doc = doc_mod.INVALID_DOC;
+    }
+
     state.renderer.draw(
         &state.canvas,
         &state.store,
         &state.diags,
         &state.brackets,
+        &state.terms,
         active,
         focused,
         hovered,
@@ -1023,6 +1310,8 @@ export fn frame() void {
         state.ctx_menu,
         completionPopupView(),
         confirmModalView(),
+        topBarView(),
+        state.drop_target_doc,
     );
 
     sg.beginPass(.{
@@ -1087,6 +1376,23 @@ fn handleMouseDown(e: *const sapp.Event) void {
             // Don't pan yet — short right-click opens the menu on blank space.
         },
         .LEFT => {
+            // Top bar breadcrumb first (screen space).
+            if (state.project.root_abs.len != 0) {
+                if (render_mod.topBarHit(
+                    topBarView(),
+                    state.mouse.x,
+                    state.mouse.y,
+                    state.canvas.viewport.dpi,
+                )) |seg_idx| {
+                    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                    const rel = state.project.pathForBreadcrumbIndex(seg_idx, &path_buf) catch "";
+                    navigateToFolder(rel) catch |err| {
+                        std.log.err("navigate breadcrumb failed: {}", .{err});
+                    };
+                    return;
+                }
+            }
+
             // Delete confirmation modal first.
             if (state.confirm_open) {
                 if (render_mod.confirmModalHit(
@@ -1133,6 +1439,22 @@ fn handleMouseDown(e: *const sapp.Event) void {
             }
             const world = state.canvas.viewport.screenToWorld(state.mouse);
             if (state.canvas.hitTest(world)) |id| {
+                // Folder icon → navigate into that child.
+                if (state.canvas.findBubble(id)) |fb| {
+                    if (fb.kind == .folder) {
+                        const child = fb.fragment_key;
+                        if (child.len > 0) {
+                            const joined = state.project.joinRel(child) catch null;
+                            if (joined) |rel| {
+                                defer state.gpa.allocator().free(rel);
+                                navigateToFolder(rel) catch |err| {
+                                    std.log.err("enter folder '{s}': {}", .{ child, err });
+                                };
+                            }
+                        }
+                        return;
+                    }
+                }
                 // Close button on title bar → confirm delete (do not start drag).
                 // The × only renders on the focused bubble, so only honor hits there.
                 if (state.focused == id) {
@@ -1143,6 +1465,11 @@ fn handleMouseDown(e: *const sapp.Event) void {
                         }
                     }
                 }
+                // Import pills, before anything focuses. Focus swaps the bubble to code, so a
+                // click resolved after that would be measured against text rows that weren't
+                // on screen when it happened.
+                if (state.canvas.hitTestTitleBar(world) != id and importPillClick(id, unscaleHover(id, world))) return;
+
                 // Click body or title → focus. Drag only from the title bar.
                 if (state.canvas.hitTestTitleBar(world) == id) {
                     // Title bar: capture grab under cursor *before* any camera fly-to,
@@ -1164,28 +1491,31 @@ fn handleMouseDown(e: *const sapp.Event) void {
                     // Body click: focus, place caret under the mouse, clear selection.
                     // Hover scale is screen-space only — unproject the click back to the
                     // unscaled bubble layout, then snap scale off so draw matches.
-                    var hit = world;
-                    if (state.hovered == id and state.hover_amount > 0.001) {
-                        if (state.canvas.findBubble(id)) |b| {
-                            // Keep in sync with render.hover_scale_max (1.07).
-                            const scale = 1.0 + (1.07 - 1.0) * std.math.clamp(state.hover_amount, 0, 1);
-                            if (scale > 1.001) {
-                                const c = b.bounds.center();
-                                hit = .{
-                                    .x = c.x + (world.x - c.x) / scale,
-                                    .y = c.y + (world.y - c.y) / scale,
-                                };
-                            }
-                        }
-                    }
+                    const hit = unscaleHover(id, world);
                     state.hover_amount = 0;
                     state.hover_anim_id = bubble_mod.INVALID_BUBBLE;
                     state.hovered = bubble_mod.INVALID_BUBBLE;
                     // Place caret first, then fly camera to the click (not the whole tall body).
                     focusBubbleOpts(id, false);
                     if (state.canvas.findBubble(id)) |b| {
-                        state.editor.placeCaretAtWorld(&state.store, b, hit);
-                        startFocusCameraOnBubble(b, hit, false);
+                        if (b.kind == .terminal) {
+                            // Start text selection in terminal cells; no editor caret.
+                            if (state.terms.find(b.term_id)) |sess| {
+                                const cell = termCellAt(b, sess, hit);
+                                sess.selection = .{
+                                    .active = true,
+                                    .a_row = cell.row,
+                                    .a_col = cell.col,
+                                    .b_row = cell.row,
+                                    .b_col = cell.col,
+                                };
+                                state.term_selecting = true;
+                            }
+                            startFocusCameraOnBubble(b, hit, false);
+                        } else {
+                            state.editor.placeCaretAtWorld(&state.store, b, hit);
+                            startFocusCameraOnBubble(b, hit, false);
+                        }
                     }
                 }
             } else {
@@ -1199,13 +1529,16 @@ fn handleMouseDown(e: *const sapp.Event) void {
 }
 
 fn activateContextMenuItem(idx: usize) void {
-    // 0 = Create new file
     if (idx == 0) {
+        // Create new file in the current project folder.
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = state.project.absCurrent(&dir_buf) catch ".";
         layout.createNewFile(
             &state.store,
             &state.canvas,
             state.ctx_menu_world,
             .zig,
+            dir,
         ) catch |err| {
             std.log.err("create new file failed: {}", .{err});
             return;
@@ -1217,6 +1550,18 @@ fn activateContextMenuItem(idx: usize) void {
             if (last.fragment()) |f| refreshDocDiags(f.doc, true);
         }
         std.log.info("created new file", .{});
+    } else if (idx == 1) {
+        // New terminal
+        const id = layout.createTerminal(
+            &state.terms,
+            &state.canvas,
+            state.ctx_menu_world,
+        ) catch |err| {
+            std.log.err("create terminal failed: {}", .{err});
+            return;
+        };
+        focusBubble(id);
+        std.log.info("created mini terminal", .{});
     }
 }
 
@@ -1240,10 +1585,13 @@ fn handleMouseUp(e: *const sapp.Event) void {
     }
 
     if (e.mouse_button == .LEFT) {
+        state.term_selecting = false;
         if (state.drag == .bubble) {
             if (state.canvas.findBubble(state.drag_bubble)) |b| {
                 b.pinned = false;
             }
+            // Cross-file move: drop onto another file's halo.
+            tryMoveDraggedBubbleToDropTarget();
             // Final collision settle after drop.
             _ = spacer.resolveDefault(&state.canvas, state.drag_bubble) catch |err| {
                 std.log.warn("spacer: {}", .{err});
@@ -1251,6 +1599,7 @@ fn handleMouseUp(e: *const sapp.Event) void {
             _ = spacer.resolveAllDefault(&state.canvas);
             spacer.recomputeWorkingSets(&state.canvas) catch {};
             state.drag_bubble = bubble_mod.INVALID_BUBBLE;
+            state.drop_target_doc = doc_mod.INVALID_DOC;
         } else if (state.drag == .pending_bubble) {
             // Pure click — leave camera anim running; unpin.
             if (state.canvas.findBubble(state.drag_bubble)) |b| {
@@ -1262,6 +1611,25 @@ fn handleMouseUp(e: *const sapp.Event) void {
     } else if (e.mouse_button == .MIDDLE) {
         if (state.drag == .pan) state.drag = .none;
     }
+}
+
+fn tryMoveDraggedBubbleToDropTarget() void {
+    const target = state.drop_target_doc;
+    if (target == doc_mod.INVALID_DOC) return;
+    const bid = state.drag_bubble;
+    if (bid == bubble_mod.INVALID_BUBBLE) return;
+    const b = state.canvas.findBubble(bid) orelse return;
+    if (b.kind != .code and b.kind != .imports) return;
+    const src = b.fragment() orelse return;
+    if (src.doc == target) return;
+
+    edit_mod.moveFragmentToDoc(&state.editor, &state.store, &state.canvas, bid, target) catch |err| {
+        std.log.err("move bubble to file failed: {}", .{err});
+        return;
+    };
+    spacer.recomputeWorkingSets(&state.canvas) catch {};
+    refreshAllDiags(true);
+    std.log.info("moved bubble into another file", .{});
 }
 
 fn handleMouseMove(e: *const sapp.Event) void {
@@ -1280,6 +1648,22 @@ fn handleMouseMove(e: *const sapp.Event) void {
                 closeContextMenu();
             }
         }
+    }
+
+    // Terminal text selection drag.
+    if (state.term_selecting) {
+        if (state.canvas.findBubble(state.focused)) |b| {
+            if (b.kind == .terminal) {
+                if (state.terms.find(b.term_id)) |sess| {
+                    const world = state.canvas.viewport.screenToWorld(state.mouse);
+                    const cell = termCellAt(b, sess, world);
+                    sess.selection.b_row = cell.row;
+                    sess.selection.b_col = cell.col;
+                    sess.selection.active = true;
+                }
+            }
+        }
+        return;
     }
 
     switch (state.drag) {
@@ -1321,6 +1705,19 @@ fn handleScroll(e: *const sapp.Event) void {
         cancelFocusCamera();
         zoomByScroll(sy);
         return;
+    }
+
+    // Focused terminal: scrollback (positive sy = look at older lines).
+    if (focusedIsTerminal()) {
+        if (focusedTermSession()) |sess| {
+            // Trackpad: scroll_y is often small fractional; accumulate as lines.
+            const lines: i32 = if (@abs(sy) < 1.0)
+                if (sy > 0) @as(i32, 1) else if (sy < 0) @as(i32, -1) else 0
+            else
+                @intFromFloat(@round(sy));
+            if (lines != 0) sess.scroll(lines * 3);
+            return;
+        }
     }
 
     // Focused tall bubble: two-finger vertical (Magic Mouse / trackpad) pans to read.
@@ -1502,7 +1899,7 @@ fn handleKeyDown(e: *const sapp.Event) void {
     }
 
     // Completion navigation / accept (before edit keys).
-    if (state.completion_open and state.focused != bubble_mod.INVALID_BUBBLE) {
+    if (state.completion_open and state.focused != bubble_mod.INVALID_BUBBLE and !focusedIsTerminal()) {
         if (e.key_code == .UP) {
             if (state.completion_selected > 0) state.completion_selected -= 1;
             return;
@@ -1518,16 +1915,22 @@ fn handleKeyDown(e: *const sapp.Event) void {
         }
     }
 
-    // Ctrl/Cmd+Space → force completion.
-    if (isMod(e) and !isShift(e) and e.key_code == .SPACE) {
-        refreshCompletion(true);
-        return;
-    }
-
     // Track WASD always so key-up stays in sync; pan only applies when unfocused.
     if (!isMod(e) and !isAlt(e) and setWasdKey(e.key_code, true)) {
         if (state.focused == bubble_mod.INVALID_BUBBLE) return; // don't type WASD into a bubble if unfocused
         // Focused: fall through so W/A/S/D can still insert via CHAR (held flags ignored while focused).
+    }
+
+    // ── Mini terminal input (before editor shortcuts) ──────────────────
+    if (focusedIsTerminal()) {
+        handleTerminalKeyDown(e);
+        return;
+    }
+
+    // Ctrl/Cmd+Space → force completion.
+    if (isMod(e) and !isShift(e) and e.key_code == .SPACE) {
+        refreshCompletion(true);
+        return;
     }
 
     if (isSaveKey(e)) {
@@ -1728,9 +2131,81 @@ fn handleKeyDown(e: *const sapp.Event) void {
     }
 }
 
+fn handleTerminalKeyDown(e: *const sapp.Event) void {
+    const sess = focusedTermSession() orelse return;
+    if (state.drag == .pan or state.drag == .bubble) return;
+
+    // Cmd/Ctrl+C → copy selection (not SIGINT). Plain Ctrl+C without Super is interrupt.
+    if (isMod(e) and e.key_code == .C and !isAlt(e)) {
+        // Super (Cmd) or Ctrl with selection → copy.
+        // Prefer Cmd+C for copy; Ctrl+C without selection → interrupt.
+        const has_sel = sess.selection.active;
+        const use_cmd = (e.modifiers & sapp.modifier_super) != 0;
+        if (has_sel or use_cmd) {
+            if (has_sel) {
+                var buf: [8192]u8 = undefined;
+                const text = sess.copySelection(&buf);
+                if (text.len > 0) {
+                    // Need null-terminated for sokol.
+                    var zbuf: [8193]u8 = undefined;
+                    const n = @min(text.len, zbuf.len - 1);
+                    @memcpy(zbuf[0..n], text[0..n]);
+                    zbuf[n] = 0;
+                    sapp.setClipboardString(zbuf[0..n :0]);
+                }
+            }
+            return;
+        }
+        // Ctrl+C → interrupt
+        sess.write(&.{0x03});
+        return;
+    }
+    if (isMod(e) and e.key_code == .V and !isAlt(e)) {
+        const clip = sapp.getClipboardString();
+        if (clip.len > 0) sess.write(clip);
+        return;
+    }
+
+    // Ctrl+letter → control bytes (when not Super).
+    if ((e.modifiers & sapp.modifier_ctrl) != 0 and (e.modifiers & sapp.modifier_super) == 0 and !isAlt(e)) {
+        switch (e.key_code) {
+            .C => sess.write(&.{0x03}), // already handled above, but keep
+            .D => sess.write(&.{0x04}),
+            .Z => sess.write(&.{0x1A}),
+            .L => sess.write(&.{0x0C}),
+            .A => sess.write(&.{0x01}),
+            .E => sess.write(&.{0x05}),
+            .U => sess.write(&.{0x15}),
+            .W => sess.write(&.{0x17}),
+            .R => sess.write(&.{0x12}),
+            else => {},
+        }
+        return;
+    }
+
+    if (isMod(e)) return; // other cmd shortcuts ignored in terminal
+
+    switch (e.key_code) {
+        .ENTER => sess.write("\r"),
+        .BACKSPACE => sess.write(&.{0x7F}),
+        .TAB => sess.write("\t"),
+        .ESCAPE => sess.write("\x1b"),
+        .DELETE => sess.write("\x1b[3~"),
+        .UP => sess.write("\x1b[A"),
+        .DOWN => sess.write("\x1b[B"),
+        .RIGHT => sess.write("\x1b[C"),
+        .LEFT => sess.write("\x1b[D"),
+        .HOME => sess.write("\x1b[H"),
+        .END => sess.write("\x1b[F"),
+        .PAGE_UP => sess.scroll(8),
+        .PAGE_DOWN => sess.scroll(-8),
+        else => {},
+    }
+}
+
 fn handleChar(e: *const sapp.Event) void {
     // Cmd/Ctrl+S sometimes arrives as CHAR on some platforms.
-    if (isSaveKey(e)) {
+    if (isSaveKey(e) and !focusedIsTerminal()) {
         if (isShift(e)) {
             saveAllDirtyBubbles();
         } else {
@@ -1746,6 +2221,15 @@ fn handleChar(e: *const sapp.Event) void {
     const cp = e.char_code;
     if (cp < 32 or cp > 126) return;
     if (cp == 127) return;
+
+    // Terminal: forward printable to PTY.
+    if (focusedIsTerminal()) {
+        if (focusedTermSession()) |sess| {
+            var buf: [1]u8 = .{@intCast(cp)};
+            sess.write(&buf);
+        }
+        return;
+    }
 
     var buf: [1]u8 = .{@intCast(cp)};
     state.editor.insertText(&state.store, &state.canvas, state.focused, &buf) catch {};
@@ -1780,7 +2264,10 @@ export fn cleanup() void {
         state.completion_items.deinit(state.gpa.allocator());
         state.completion_labels.deinit(state.gpa.allocator());
         state.editor.deinit();
+        // Kill all PTYs before canvas frees bubbles.
+        state.terms.deinit();
         state.canvas.deinit();
+        state.project.deinit();
         state.brackets.deinit();
         state.diags.deinit();
         state.store.deinit();

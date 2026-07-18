@@ -8,6 +8,8 @@ Based on Bragdon et al., *Code Bubbles* (ICSE 2010), and the current zega codeba
 - [x] Bubbles as editable fragments (light chrome)
 - [x] No overlap / bubble spacer
 - [x] Working-set proximity groups + color halos
+- [x] File-halos (group by document) + project folder open
+- [x] Folder icons + breadcrumb navigate-in-place
 - [x] Horizontal reflow (view-only)
 - [x] Document-backed Zig/Rust fragments, outline → bubbles
 - [x] Edit, save, undo; JetBrains Mono; syntax highlight
@@ -62,6 +64,7 @@ Paper used Eclipse; zega targets **zls** + **rust-analyzer**.
 - [ ] Note bubbles (richer edit, sticky)
 - [ ] Flag bubbles (icons / labels)
 - [ ] Docs bubbles (markdown / doc comments)
+- [x] Mini terminal bubbles (PTY/zsh, context menu, many independent)
 - [ ] Optional: web / issue bubbles later
 
 ## Phase 6 — Debugging with bubbles (§6.5)

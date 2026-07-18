@@ -623,7 +623,10 @@ fn matchZigItem(t: []const u8) ?Match {
 }
 
 /// True for `@import(…)`, `@cImport(…)`, or those with field access after.
-fn isZigImportRhs(rhs: []const u8) bool {
+/// True when the right-hand side of a `const` binding makes it a module import.
+/// Shared with the pill view so the RHS test has one definition — though the surrounding
+/// context tests (strings, comments, depth) are this scanner's alone; see `pills.parse`.
+pub fn isZigImportRhs(rhs: []const u8) bool {
     if (std.mem.startsWith(u8, rhs, "@import") and (rhs.len == 7 or !isIdentCont(rhs[7])))
         return true;
     if (std.mem.startsWith(u8, rhs, "@cImport") and (rhs.len == 8 or !isIdentCont(rhs[8])))
